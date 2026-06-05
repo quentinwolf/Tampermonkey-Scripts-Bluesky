@@ -5,7 +5,7 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.2.0
+// @version      2.2.1
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -316,9 +316,16 @@
 
     function makeTile(t) {
         const img = el('img', { src: t.thumb, alt: t.alt, loading: 'lazy', draggable: false });
-        const tile = el('button', {
-            class: 'bgt-tile', title: t.alt || '',
-            onClick: () => {
+        // Real anchor (not a button) so the browser's own link affordances all point
+        // at the actual post: middle-click / ctrl- / shift-click open it in a new tab,
+        // and the right-click menu offers "Open in new tab" + "Copy link". We only
+        // hijack a plain left-click for the in-grid lightbox / open-post behaviour.
+        const tile = el('a', {
+            class: 'bgt-tile', title: t.alt || '', href: t.url,
+            onClick: (e) => {
+                // Leave modified / non-primary clicks to the browser (new tab, etc).
+                if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+                e.preventDefault();
                 if (t.kind === 'image') openLightbox(t._imgIndex);
                 else unsafeWindow.open(t.url, '_blank', 'noopener'); // video/gif -> the post
             },
@@ -738,8 +745,9 @@
             display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--bgt-tile-full, 150px), 1fr)); gap: 3px;
         }
         #${OVERLAY_ID} .bgt-tile {
-            position: relative; aspect-ratio: 1 / 1; overflow: hidden; background: #11171f;
+            position: relative; display: block; aspect-ratio: 1 / 1; overflow: hidden; background: #11171f;
             border: none; padding: 0; cursor: pointer; border-radius: 2px;
+            text-decoration: none; color: inherit;
         }
         #${OVERLAY_ID} .bgt-tile img {
             width: 100%; height: 100%; object-fit: cover; display: block; transition: transform .15s ease;
