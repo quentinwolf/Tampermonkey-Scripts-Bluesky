@@ -5,7 +5,7 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.3.0
+// @version      2.3.1
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -624,8 +624,7 @@
         lbLike = lbActButton('like', ICON_HEART, true, () => toggleLike(curPostState()));
         lbBookmark = lbActButton('bookmark', ICON_BOOKMARK, false, () => toggleBookmark(curPostState()));
         lbActionsRow = el('div', { class: 'bgt-lb-actions' },
-            lbReply.btn, lbRepost.btn, lbLike.btn, lbBookmark.btn,
-            el('div', { class: 'bgt-lb-actspacer' }), lbLink);
+            lbReply.btn, lbRepost.btn, lbLike.btn, lbBookmark.btn, lbLink);
 
         const bar = el('div', { class: 'bgt-lb-bar' }, lbActionsRow, lbCap);
 
@@ -741,31 +740,36 @@
 
     function waitForInlineHost(actor) {
         waitingActor = actor;
-        const startedAt = Date.now();
 
-        const attempt = () => {
+        // "Sit and watch" for the media feed to appear (e.g. when you switch to the
+        // Media tab). Deliberately NO full-screen fallback and NO constant polling:
+        // the observer only does work when the DOM actually changes, and the check is
+        // debounced so a burst of mutations collapses into one. That keeps it cheap
+        // even with many tabs parked on profiles, and it never surprises you with the
+        // full-page grid just because the in-line anchor isn't on screen yet.
+        const check = () => {
+            mountTimer = null;
             if (waitingActor !== actor || rootEl) { stopWaiting(); return; }
             if (inlineReady() && mountInline(pendingHeader)) {
                 stopWaiting();
                 finishMount();
-            } else if (Date.now() - startedAt > 6000) {
-                stopWaiting();
-                console.warn('[Gallery Toggle] in-line anchor not found; using full-screen.');
-                mountFullscreen(pendingHeader);
-                finishMount();
             }
+            // otherwise: keep waiting until the media feed shows up
+        };
+        const schedule = () => {
+            if (mountTimer) return;                 // a check is already queued
+            mountTimer = setTimeout(check, 250);    // coalesce bursts of mutations
         };
 
-        mountObserver = new MutationObserver(attempt);
+        mountObserver = new MutationObserver(schedule);
         mountObserver.observe(document.body, { childList: true, subtree: true });
-        mountTimer = setInterval(attempt, 300); // in case mutations go quiet
-        attempt();
+        check(); // try once right away
     }
 
     function stopWaiting() {
         waitingActor = null;
         if (mountObserver) { mountObserver.disconnect(); mountObserver = null; }
-        if (mountTimer) { clearInterval(mountTimer); mountTimer = null; }
+        if (mountTimer) { clearTimeout(mountTimer); mountTimer = null; }
     }
 
     function removeOverlay() {
@@ -1028,8 +1032,7 @@
             display: flex; flex-direction: column; gap: 8px; color: #e6e9ec; font-size: 14px;
             background: linear-gradient(transparent, rgba(0,0,0,0.82));
         }
-        #${LIGHTBOX_ID} .bgt-lb-actions { display: flex; align-items: center; gap: 6px; }
-        #${LIGHTBOX_ID} .bgt-lb-actspacer { flex: 1; }
+        #${LIGHTBOX_ID} .bgt-lb-actions { display: flex; align-items: center; justify-content: center; gap: 6px; }
         #${LIGHTBOX_ID} .bgt-lb-cap { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         #${LIGHTBOX_ID} .bgt-lb-post { color: #4aa8ff; text-decoration: none; white-space: nowrap; }
         .bgt-act {
