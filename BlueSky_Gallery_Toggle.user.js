@@ -5,7 +5,7 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.4.3
+// @version      2.5.3
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -28,6 +28,8 @@
     const MODE_KEY = 'bsky-gallery-mode';            // 'fullscreen' | 'inline'
     const SIZE_KEY = 'bsky-gallery-size';            // 'small' | 'medium' | 'large'
     const DEBUG_KEY = 'bsky-gallery-debug';          // boolean: console logging
+    const POSTINFO_KEY = 'bsky-gallery-postinfo';    // boolean: post text in lightbox
+    const ALT_KEY = 'bsky-gallery-alt';              // boolean: image alt text in lightbox
     const PAGE_LIMIT = 100;                          // max getAuthorFeed page size
     const PUBLIC_API = 'https://public.api.bsky.app'; // unauthenticated fallback
     const ACCENT = '#4aa8ff';
@@ -60,6 +62,8 @@
         mode: GM_getValue(MODE_KEY, 'fullscreen'),
         size: GM_getValue(SIZE_KEY, 'medium'),
         debug: GM_getValue(DEBUG_KEY, false),
+        postInfo: GM_getValue(POSTINFO_KEY, false),
+        altText: GM_getValue(ALT_KEY, false),
     };
 
     // Gated console logging - toggle via the settings modal (Debug logging).
@@ -186,6 +190,7 @@
         const v = (post && post.viewer) || {};
         return {
             uri: post.uri, cid: post.cid, url: postUrl(post),
+            text: (post.record && typeof post.record.text === 'string') ? post.record.text : '',
             replyCount: post.replyCount || 0,
             repostCount: post.repostCount || 0,
             likeCount: post.likeCount || 0,
@@ -664,7 +669,7 @@
      * 5. Lightbox for images (videos/gifs open the post instead).
      * ==================================================================== */
     let lbEl, lbImg, lbCap, lbLink, lbPrev, lbNext, lbIndex = 0, lbKeyHandler;
-    let lbActionsRow, lbReply, lbRepost, lbLike, lbBookmark;
+    let lbActionsRow, lbReply, lbRepost, lbLike, lbBookmark, lbPostText;
 
     // Build one action button. `withCount` adds a live counter; like/bookmark pass a
     // second path so the icon can swap to its filled variant when active.
@@ -715,6 +720,7 @@
     function buildLightbox() {
         lbImg = el('img', { class: 'bgt-lbimg', alt: '' });
         lbCap = el('div', { class: 'bgt-lb-cap' });
+        lbPostText = el('div', { class: 'bgt-lb-text' });
         lbLink = el('a', { class: 'bgt-lb-post', target: '_blank', rel: 'noopener' }, 'Open post ↗');
 
         // Native-style action bar. Each handler reads the post currently shown, so
@@ -726,7 +732,11 @@
         lbActionsRow = el('div', { class: 'bgt-lb-actions' },
             lbReply.btn, lbRepost.btn, lbLike.btn, lbBookmark.btn, lbLink);
 
-        const bar = el('div', { class: 'bgt-lb-bar' }, lbActionsRow, lbCap);
+        // Action row is pinned LAST so it stays anchored to the bottom; post text and
+        // alt caption stack ABOVE it. That way toggling the alt caption pushes the post
+        // text up (over the image, where captions belong) instead of shoving the
+        // buttons up into the image.
+        const bar = el('div', { class: 'bgt-lb-bar' }, lbPostText, lbCap, lbActionsRow);
 
         lbPrev = el('button', { class: 'bgt-iconbtn bgt-lb-nav bgt-lb-prev', title: 'Previous', onClick: (e) => { e.stopPropagation(); navLightbox(-1); } }, '‹');
         lbNext = el('button', { class: 'bgt-iconbtn bgt-lb-nav bgt-lb-next', title: 'Next', onClick: (e) => { e.stopPropagation(); navLightbox(1); } }, '›');
@@ -750,11 +760,28 @@
         if (!it) return;
         lbImg.src = it.full;
         lbImg.alt = it.alt || '';
-        lbCap.textContent = it.alt || '';
         lbLink.href = it.url;
         lbPrev.style.visibility = lbIndex > 0 ? 'visible' : 'hidden';
         lbNext.style.visibility = lbIndex < grid.images.length - 1 ? 'visible' : 'hidden';
         updateActionBar();
+        applyPostInfo();
+        applyAltText();
+    }
+
+    function applyPostInfo() {
+        if (!lbPostText) return;
+        const st = curPostState();
+        const text = (settings.postInfo && st && st.text) ? st.text : '';
+        lbPostText.textContent = text;
+        lbPostText.style.display = text ? 'block' : 'none';
+    }
+
+    function applyAltText() {
+        if (!lbCap) return;
+        const it = grid.images[lbIndex];
+        const alt = (settings.altText && it && it.alt) ? it.alt : '';
+        lbCap.textContent = alt;
+        lbCap.style.display = alt ? 'block' : 'none';
     }
 
     function openLightbox(i) {
@@ -987,6 +1014,18 @@
         console.log('[Gallery Toggle] debug logging ' + (settings.debug ? 'enabled' : 'disabled'));
     }
 
+    function setPostInfo(on) {
+        settings.postInfo = !!on;
+        GM_setValue(POSTINFO_KEY, settings.postInfo);
+        applyPostInfo(); // live-update if the lightbox is open
+    }
+
+    function setAltText(on) {
+        settings.altText = !!on;
+        GM_setValue(ALT_KEY, settings.altText);
+        applyAltText(); // live-update if the lightbox is open
+    }
+
     function openSettings() {
         if (document.getElementById(SETTINGS_ID)) return;
         const card = el('div', { class: 'bgt-settings-card' },
@@ -1000,7 +1039,13 @@
                 sizeChip('medium', 'Medium'),
                 sizeChip('large', 'Large')),
             el('div', { class: 'bgt-settings-hint' }, 'In-line columns: 5 · 4 · 3'),
-            el('label', { class: 'bgt-debug-row' },
+            el('label', { class: 'bgt-check-row' },
+                el('input', { type: 'checkbox', checked: settings.postInfo, onChange: (e) => setPostInfo(e.target.checked) }),
+                el('span', {}, 'Show post text in the lightbox')),
+            el('label', { class: 'bgt-check-row' },
+                el('input', { type: 'checkbox', checked: settings.altText, onChange: (e) => setAltText(e.target.checked) }),
+                el('span', {}, 'Show image alt text (accessibility)')),
+            el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.debug, onChange: (e) => setDebug(e.target.checked) }),
                 el('span', {}, 'Debug logging to console')),
             el('div', { class: 'bgt-settings-foot' }, el('button', { onClick: closeSettings }, 'Done'))
@@ -1169,12 +1214,19 @@
         #${LIGHTBOX_ID} .bgt-lb-prev { left: 14px; }
         #${LIGHTBOX_ID} .bgt-lb-next { right: 14px; }
         #${LIGHTBOX_ID} .bgt-lb-bar {
-            position: absolute; left: 0; right: 0; bottom: 0; padding: 10px 18px 12px;
-            display: flex; flex-direction: column; gap: 8px; color: #e6e9ec; font-size: 14px;
-            background: linear-gradient(transparent, rgba(0,0,0,0.82));
+            position: absolute; left: 0; right: 0; bottom: 0; padding: 32px 18px 12px;
+            display: flex; flex-direction: column; gap: 28px; color: #e6e9ec; font-size: 14px;
+            background: linear-gradient(transparent, rgba(0,0,0,0.88));
+            /* keep white text readable over light images, not just the gradient */
+            text-shadow: 0 1px 3px rgba(0,0,0,0.95), 0 0 4px rgba(0,0,0,0.85);
         }
         #${LIGHTBOX_ID} .bgt-lb-actions { display: flex; align-items: center; justify-content: center; gap: 6px; }
-        #${LIGHTBOX_ID} .bgt-lb-cap { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        #${LIGHTBOX_ID} .bgt-lb-text, #${LIGHTBOX_ID} .bgt-lb-cap {
+            display: none; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere;
+            overflow-y: auto; width: 50%; max-width: 450px; margin: 0 auto; line-height: 1.4;
+        }
+        #${LIGHTBOX_ID} .bgt-lb-text { max-height: 22vh; font-size: 14px; color: #f1f3f5; }
+        #${LIGHTBOX_ID} .bgt-lb-cap { max-height: 14vh; font-size: 13px; color: #d2d9e0; }
         #${LIGHTBOX_ID} .bgt-lb-post { color: #4aa8ff; text-decoration: none; white-space: nowrap; }
         .bgt-act {
             display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 10px;
@@ -1221,8 +1273,8 @@
         #${SETTINGS_ID} .bgt-size-chip:hover { background: rgba(255,255,255,0.04); }
         #${SETTINGS_ID} .bgt-size-chip input { accent-color: #0085ff; }
         #${SETTINGS_ID} .bgt-settings-hint { font-size: 12px; color: #8b98a5; margin: 8px 2px 2px; }
-        #${SETTINGS_ID} .bgt-debug-row { display: flex; align-items: center; gap: 8px; margin-top: 14px; font-size: 13px; color: #c3ccd6; cursor: pointer; }
-        #${SETTINGS_ID} .bgt-debug-row input { accent-color: #0085ff; }
+        #${SETTINGS_ID} .bgt-check-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 13px; color: #c3ccd6; cursor: pointer; }
+        #${SETTINGS_ID} .bgt-check-row input { accent-color: #0085ff; }
         #${SETTINGS_ID} .bgt-settings-foot { display: flex; justify-content: flex-end; margin-top: 12px; }
         #${SETTINGS_ID} .bgt-settings-foot button {
             background: #0085ff; color: #fff; border: none; border-radius: 8px;
