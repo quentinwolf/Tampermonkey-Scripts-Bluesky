@@ -5,7 +5,7 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.2.1
+// @version      2.3.0
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -43,6 +43,16 @@
     const ICON_GEAR = 'M19.14 12.94c.04-.3.06-.62.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.48.48 0 0 0-.59.22L2.74 8.87a.48.48 0 0 0 .12.61l2.03 1.58c-.05.3-.07.62-.07.94 0 .32.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.13.22.39.3.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.03-1.58zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2z';
     const ICON_EXT = 'M14 3h7v7h-2V6.41l-9.29 9.3-1.42-1.42 9.3-9.29H14V3zM5 5h5v2H7v10h10v-3h2v5H5V5z';
     const ICON_PLAY = 'M8 5v14l11-7z';
+
+    // Post-action icons (lifted from Bluesky's own buttons so the lightbox bar
+    // matches the native look). Heart + bookmark have a filled variant for the
+    // "on" state; the filled bookmark is Bluesky's outer silhouette, solid.
+    const ICON_REPLY = 'M20.002 7a2 2 0 0 0-2-2h-12a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2a1 1 0 0 1 1 1v1.918l3.375-2.7a1 1 0 0 1 .625-.218h5a2 2 0 0 0 2-2V7Zm2 8a4 4 0 0 1-4 4h-4.648l-4.727 3.781A1.001 1.001 0 0 1 7.002 22v-3h-1a4 4 0 0 1-4-4V7a4 4 0 0 1 4-4h12a4 4 0 0 1 4 4v8Z';
+    const ICON_REPOST = 'M17.957 2.293a1 1 0 1 0-1.414 1.414L17.836 5H6a3 3 0 0 0-3 3v3a1 1 0 1 0 2 0V8a1 1 0 0 1 1-1h11.836l-1.293 1.293a1 1 0 0 0 1.414 1.414l2.47-2.47a1.75 1.75 0 0 0 0-2.474l-2.47-2.47ZM20 12a1 1 0 0 1 1 1v3a3 3 0 0 1-3 3H6.164l1.293 1.293a1 1 0 1 1-1.414 1.414l-2.47-2.47a1.75 1.75 0 0 1 0-2.474l2.47-2.47a1 1 0 0 1 1.414 1.414L6.164 17H18a1 1 0 0 0 1-1v-3a1 1 0 0 1 1-1Z';
+    const ICON_HEART = 'M16.734 5.091c-1.238-.276-2.708.047-4.022 1.38a1 1 0 0 1-1.424 0C9.974 5.137 8.504 4.814 7.266 5.09c-1.263.282-2.379 1.206-2.92 2.556C3.33 10.18 4.252 14.84 12 19.348c7.747-4.508 8.67-9.168 7.654-11.7-.541-1.351-1.657-2.275-2.92-2.557Zm4.777 1.812c1.604 4-.494 9.69-9.022 14.47a1 1 0 0 1-.978 0C2.983 16.592.885 10.902 2.49 6.902c.779-1.942 2.414-3.334 4.342-3.764 1.697-.378 3.552.003 5.169 1.286 1.617-1.283 3.472-1.664 5.17-1.286 1.927.43 3.562 1.822 4.34 3.764Z';
+    const ICON_HEART_FILLED = 'M12.489 21.372c8.528-4.78 10.626-10.47 9.022-14.47-.779-1.941-2.414-3.333-4.342-3.763-1.697-.378-3.552.003-5.169 1.287-1.617-1.284-3.472-1.665-5.17-1.287-1.927.43-3.562 1.822-4.34 3.764-1.605 4 .493 9.69 9.021 14.47a1 1 0 0 0 .978 0Z';
+    const ICON_BOOKMARK = 'M9.7 16.895a4 4 0 0 1 4.6 0l3.7 2.6V6.5a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v12.995l3.7-2.6Zm10.3 2.6c0 1.62-1.825 2.567-3.15 1.636l-3.7-2.6a2.001 2.001 0 0 0-2.3 0l-3.7 2.6C5.825 22.062 4 21.115 4 19.495V6.5a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4v12.995Z';
+    const ICON_BOOKMARK_FILLED = 'M20 19.495C20 21.115 18.175 22.062 16.85 21.131L13.15 18.531A2.001 2.001 0 0 0 10.85 18.531L7.15 21.131C5.825 22.062 4 21.115 4 19.495V6.5A4 4 0 0 1 8 2.5H16A4 4 0 0 1 20 6.5V19.495Z';
 
     let galleryEnabled = GM_getValue(STORAGE_KEY, false);
     const settings = {
@@ -155,6 +165,23 @@
         return 'https://bsky.app/profile/' + handle + '/post/' + rkey;
     }
 
+    // Distil the bits the lightbox action bar needs: identity (uri/cid) for writes,
+    // current counts, and the viewer's like/repost record URIs + bookmark flag so we
+    // can show the right pressed state and toggle it. One object is shared by every
+    // image tile from the same post, so a like/repost updates them together.
+    function postStateFrom(post) {
+        const v = (post && post.viewer) || {};
+        return {
+            uri: post.uri, cid: post.cid, url: postUrl(post),
+            replyCount: post.replyCount || 0,
+            repostCount: post.repostCount || 0,
+            likeCount: post.likeCount || 0,
+            likeUri: v.like || null,
+            repostUri: v.repost || null,
+            bookmarked: !!v.bookmarked,
+        };
+    }
+
     function tilesFromPost(post) {
         const tiles = [];
         let embed = post && post.embed;
@@ -167,6 +194,7 @@
         const type = embed.$type;
 
         if (type === 'app.bsky.embed.images#view' && Array.isArray(embed.images)) {
+            const ps = postStateFrom(post); // shared across this post's image tiles
             embed.images.forEach(img => {
                 tiles.push({
                     kind: 'image',
@@ -174,6 +202,7 @@
                     full: img.fullsize,   // already @jpeg from the AppView
                     alt: img.alt || '',
                     url: postUrl(post),
+                    postState: ps,
                 });
             });
         } else if (type === 'app.bsky.embed.video#view') {
@@ -346,7 +375,7 @@
             grid.seen.add(key);
             if (t.kind === 'image') {
                 t._imgIndex = grid.images.length;
-                grid.images.push({ full: t.full, alt: t.alt, url: t.url });
+                grid.images.push({ full: t.full, alt: t.alt, url: t.url, postState: t.postState });
             }
             frag.appendChild(makeTile(t));
         });
@@ -390,15 +419,215 @@
     }
 
     /* ======================================================================
+     * 4b. Post actions (like / repost / bookmark) driven straight off the
+     *     borrowed session - the same token we read the feed with can write,
+     *     so these are real records, not a fake UI. Like/repost are repo
+     *     records on your PDS; bookmarks are an AppView call (proxied).
+     * ==================================================================== */
+    let myDid = null, myDidTok = null;
+
+    // The atproto access token is a JWT whose `sub` is the account DID - decode it
+    // locally rather than spend a round-trip on getSession. Re-derived if the app
+    // rotates the token.
+    function b64urlToStr(s) {
+        s = String(s).replace(/-/g, '+').replace(/_/g, '/');
+        while (s.length % 4) s += '=';
+        return atob(s);
+    }
+    function getMyDid() {
+        const authz = auth.headers && auth.headers.authorization;
+        if (!authz) return null;
+        const tok = authz.replace(/^bearer\s+/i, '');
+        if (myDid && myDidTok === tok) return myDid;
+        try {
+            const payload = JSON.parse(b64urlToStr(tok.split('.')[1]));
+            if (payload && typeof payload.sub === 'string' && payload.sub.indexOf('did:') === 0) {
+                myDid = payload.sub; myDidTok = tok; return myDid;
+            }
+        } catch (e) { /* not a decodable JWT */ }
+        return null;
+    }
+
+    // POST an XRPC procedure on the borrowed session. `useProxy` forwards the
+    // app's atproto-proxy header so app.bsky.* calls reach the AppView; repo
+    // writes (com.atproto.*) are handled by the PDS itself, so they omit it.
+    async function xrpcPost(method, body, useProxy) {
+        if (!auth.origin || !auth.headers || !auth.headers.authorization) throw new Error('no session');
+        const headers = { 'authorization': auth.headers.authorization, 'content-type': 'application/json' };
+        if (useProxy) {
+            ['atproto-proxy', 'atproto-accept-labelers', 'accept-language'].forEach(k => {
+                if (auth.headers[k]) headers[k] = auth.headers[k];
+            });
+        }
+        const res = await nativeFetch(auth.origin + '/xrpc/' + method, {
+            method: 'POST', headers, body: JSON.stringify(body), credentials: 'omit',
+        });
+        if (!res.ok) throw new Error(method + ' ' + res.status);
+        const text = await res.text();
+        try { return text ? JSON.parse(text) : {}; } catch (_) { return {}; }
+    }
+    const rkeyOf = (uri) => String(uri).split('/').pop();
+    const repoCreate = (repo, collection, record) => xrpcPost('com.atproto.repo.createRecord', { repo, collection, record }, false);
+    const repoDelete = (repo, collection, rkey) => xrpcPost('com.atproto.repo.deleteRecord', { repo, collection, rkey }, false);
+
+    // Abbreviate like Bluesky: 999 -> "999", 1200 -> "1.2K", 0 -> "" (icon only).
+    function fmtCount(n) {
+        n = n || 0;
+        if (n <= 0) return '';
+        if (n < 1000) return String(n);
+        if (n < 1e6) { const v = n / 1e3; return (v >= 100 ? Math.round(v) : Math.round(v * 10) / 10) + 'K'; }
+        const v = n / 1e6; return (v >= 100 ? Math.round(v) : Math.round(v * 10) / 10) + 'M';
+    }
+
+    // Each toggle flips the UI optimistically, fires the write, and rolls back on
+    // failure. Without a writable session we just open the post so the user can act
+    // natively. A busy flag guards against double-taps racing the network.
+    async function toggleLike(st) {
+        if (!st || st._busyLike) return;
+        const did = getMyDid();
+        if (!did) { unsafeWindow.open(st.url, '_blank', 'noopener'); return; }
+        st._busyLike = true;
+        const was = !!st.likeUri, prev = st.likeUri;
+        st.likeUri = was ? null : 'pending';
+        st.likeCount = Math.max(0, st.likeCount + (was ? -1 : 1));
+        updateActionBar();
+        try {
+            if (was) {
+                await repoDelete(did, 'app.bsky.feed.like', rkeyOf(prev));
+                st.likeUri = null;
+            } else {
+                const r = await repoCreate(did, 'app.bsky.feed.like',
+                    { '$type': 'app.bsky.feed.like', subject: { uri: st.uri, cid: st.cid }, createdAt: new Date().toISOString() });
+                st.likeUri = (r && r.uri) || null;
+                if (!st.likeUri) throw new Error('no uri returned');
+            }
+        } catch (e) {
+            console.error('[Gallery Toggle] like failed:', e);
+            st.likeUri = prev;
+            st.likeCount = Math.max(0, st.likeCount + (was ? 1 : -1));
+        } finally {
+            st._busyLike = false;
+            updateActionBar();
+        }
+    }
+
+    async function toggleRepost(st) {
+        if (!st || st._busyRepost) return;
+        const did = getMyDid();
+        if (!did) { unsafeWindow.open(st.url, '_blank', 'noopener'); return; }
+        st._busyRepost = true;
+        const was = !!st.repostUri, prev = st.repostUri;
+        st.repostUri = was ? null : 'pending';
+        st.repostCount = Math.max(0, st.repostCount + (was ? -1 : 1));
+        updateActionBar();
+        try {
+            if (was) {
+                await repoDelete(did, 'app.bsky.feed.repost', rkeyOf(prev));
+                st.repostUri = null;
+            } else {
+                const r = await repoCreate(did, 'app.bsky.feed.repost',
+                    { '$type': 'app.bsky.feed.repost', subject: { uri: st.uri, cid: st.cid }, createdAt: new Date().toISOString() });
+                st.repostUri = (r && r.uri) || null;
+                if (!st.repostUri) throw new Error('no uri returned');
+            }
+        } catch (e) {
+            console.error('[Gallery Toggle] repost failed:', e);
+            st.repostUri = prev;
+            st.repostCount = Math.max(0, st.repostCount + (was ? 1 : -1));
+        } finally {
+            st._busyRepost = false;
+            updateActionBar();
+        }
+    }
+
+    async function toggleBookmark(st) {
+        if (!st || st._busyBm) return;
+        const did = getMyDid();
+        if (!did) { unsafeWindow.open(st.url, '_blank', 'noopener'); return; }
+        st._busyBm = true;
+        const was = !!st.bookmarked;
+        st.bookmarked = !was;
+        updateActionBar();
+        try {
+            if (was) await xrpcPost('app.bsky.bookmark.deleteBookmark', { uri: st.uri }, true);
+            else await xrpcPost('app.bsky.bookmark.createBookmark', { uri: st.uri, cid: st.cid }, true);
+        } catch (e) {
+            console.error('[Gallery Toggle] bookmark failed:', e);
+            st.bookmarked = was;
+        } finally {
+            st._busyBm = false;
+            updateActionBar();
+        }
+    }
+
+    /* ======================================================================
      * 5. Lightbox for images (videos/gifs open the post instead).
      * ==================================================================== */
     let lbEl, lbImg, lbCap, lbLink, lbPrev, lbNext, lbIndex = 0, lbKeyHandler;
+    let lbActionsRow, lbReply, lbRepost, lbLike, lbBookmark;
+
+    // Build one action button. `withCount` adds a live counter; like/bookmark pass a
+    // second path so the icon can swap to its filled variant when active.
+    function iconWithPath(d, size) {
+        const svg = svgIcon(d, size, size);
+        return { svg, path: svg.querySelector('path') };
+    }
+    function lbActButton(kind, pathD, withCount, onClick) {
+        const ip = iconWithPath(pathD, 22);
+        const out = { btn: null, path: ip.path, count: null };
+        const kids = [ip.svg];
+        if (withCount) { out.count = el('span', { class: 'bgt-act-count' }, ''); kids.push(out.count); }
+        out.btn = el('button', { class: 'bgt-act bgt-act-' + kind, type: 'button', onClick }, kids);
+        return out;
+    }
+
+    function curPostState() {
+        const im = grid.images[lbIndex];
+        return im && im.postState;
+    }
+
+    // Repaint the action bar for the post currently shown in the lightbox.
+    function updateActionBar() {
+        if (!lbActionsRow) return;
+        const st = curPostState();
+        if (!st) { lbActionsRow.style.visibility = 'hidden'; return; }
+        lbActionsRow.style.visibility = 'visible';
+        const canWrite = !!getMyDid();
+
+        lbReply.count.textContent = fmtCount(st.replyCount);
+        lbReply.btn.title = 'Reply (opens post)';
+
+        lbRepost.count.textContent = fmtCount(st.repostCount);
+        lbRepost.btn.classList.toggle('bgt-on', !!st.repostUri);
+        lbRepost.btn.title = !canWrite ? 'Repost (opens post)' : (st.repostUri ? 'Undo repost' : 'Repost');
+
+        const liked = !!st.likeUri;
+        lbLike.count.textContent = fmtCount(st.likeCount);
+        lbLike.btn.classList.toggle('bgt-on', liked);
+        lbLike.path.setAttribute('d', liked ? ICON_HEART_FILLED : ICON_HEART);
+        lbLike.btn.title = !canWrite ? 'Like (opens post)' : (liked ? 'Unlike' : 'Like');
+
+        lbBookmark.btn.classList.toggle('bgt-on', !!st.bookmarked);
+        lbBookmark.path.setAttribute('d', st.bookmarked ? ICON_BOOKMARK_FILLED : ICON_BOOKMARK);
+        lbBookmark.btn.title = !canWrite ? 'Save (opens post)' : (st.bookmarked ? 'Remove bookmark' : 'Save');
+    }
 
     function buildLightbox() {
         lbImg = el('img', { class: 'bgt-lbimg', alt: '' });
         lbCap = el('div', { class: 'bgt-lb-cap' });
         lbLink = el('a', { class: 'bgt-lb-post', target: '_blank', rel: 'noopener' }, 'Open post ↗');
-        const bar = el('div', { class: 'bgt-lb-bar' }, lbCap, lbLink);
+
+        // Native-style action bar. Each handler reads the post currently shown, so
+        // the single reused bar always acts on the right post as you navigate.
+        lbReply = lbActButton('reply', ICON_REPLY, true, () => { const st = curPostState(); if (st) unsafeWindow.open(st.url, '_blank', 'noopener'); });
+        lbRepost = lbActButton('repost', ICON_REPOST, true, () => toggleRepost(curPostState()));
+        lbLike = lbActButton('like', ICON_HEART, true, () => toggleLike(curPostState()));
+        lbBookmark = lbActButton('bookmark', ICON_BOOKMARK, false, () => toggleBookmark(curPostState()));
+        lbActionsRow = el('div', { class: 'bgt-lb-actions' },
+            lbReply.btn, lbRepost.btn, lbLike.btn, lbBookmark.btn,
+            el('div', { class: 'bgt-lb-actspacer' }), lbLink);
+
+        const bar = el('div', { class: 'bgt-lb-bar' }, lbActionsRow, lbCap);
 
         lbPrev = el('button', { class: 'bgt-iconbtn bgt-lb-nav bgt-lb-prev', title: 'Previous', onClick: (e) => { e.stopPropagation(); navLightbox(-1); } }, '‹');
         lbNext = el('button', { class: 'bgt-iconbtn bgt-lb-nav bgt-lb-next', title: 'Next', onClick: (e) => { e.stopPropagation(); navLightbox(1); } }, '›');
@@ -426,6 +655,7 @@
         lbLink.href = it.url;
         lbPrev.style.visibility = lbIndex > 0 ? 'visible' : 'hidden';
         lbNext.style.visibility = lbIndex < grid.images.length - 1 ? 'visible' : 'hidden';
+        updateActionBar();
     }
 
     function openLightbox(i) {
@@ -794,12 +1024,27 @@
         #${LIGHTBOX_ID} .bgt-lb-prev { left: 14px; }
         #${LIGHTBOX_ID} .bgt-lb-next { right: 14px; }
         #${LIGHTBOX_ID} .bgt-lb-bar {
-            position: absolute; left: 0; right: 0; bottom: 0; padding: 12px 18px;
-            display: flex; gap: 16px; align-items: center; color: #e6e9ec; font-size: 14px;
+            position: absolute; left: 0; right: 0; bottom: 0; padding: 10px 18px 12px;
+            display: flex; flex-direction: column; gap: 8px; color: #e6e9ec; font-size: 14px;
             background: linear-gradient(transparent, rgba(0,0,0,0.82));
         }
-        #${LIGHTBOX_ID} .bgt-lb-cap { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        #${LIGHTBOX_ID} .bgt-lb-actions { display: flex; align-items: center; gap: 6px; }
+        #${LIGHTBOX_ID} .bgt-lb-actspacer { flex: 1; }
+        #${LIGHTBOX_ID} .bgt-lb-cap { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         #${LIGHTBOX_ID} .bgt-lb-post { color: #4aa8ff; text-decoration: none; white-space: nowrap; }
+        .bgt-act {
+            display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 10px;
+            border: none; background: transparent; color: #aeb9c4; cursor: pointer; border-radius: 999px;
+            font-size: 14px; font-weight: 600; line-height: 1;
+            font-family: InterVariable, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, sans-serif;
+            transition: background-color 100ms ease, color 100ms ease;
+        }
+        .bgt-act:hover { background: rgba(127,127,127,0.22); }
+        .bgt-act svg { display: block; }
+        .bgt-act-count:empty { display: none; }
+        .bgt-act-like.bgt-on { color: #EC4899; }
+        .bgt-act-repost.bgt-on { color: #09B35E; }
+        .bgt-act-bookmark.bgt-on { color: ${ACCENT}; }
 
         /* ---- settings modal ---- */
         #${SETTINGS_ID} {
