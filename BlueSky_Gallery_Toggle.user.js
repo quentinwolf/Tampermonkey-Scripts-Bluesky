@@ -3,6 +3,7 @@
 // @description  Replaces a profile's Media view with an x.com-style media grid (images + video), fed live by the AT Protocol API with infinite scroll. Full-screen or in-line.
 // @author       @quentinwolf.ca
 // @match        *://bsky.app/*
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
 // @version      2.1.2
 // @run-at       document-start
