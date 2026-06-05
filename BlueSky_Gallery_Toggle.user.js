@@ -5,7 +5,7 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.3.1
+// @version      2.4.3
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -27,6 +27,7 @@
     const STORAGE_KEY = 'bsky-gallery-enabled';
     const MODE_KEY = 'bsky-gallery-mode';            // 'fullscreen' | 'inline'
     const SIZE_KEY = 'bsky-gallery-size';            // 'small' | 'medium' | 'large'
+    const DEBUG_KEY = 'bsky-gallery-debug';          // boolean: console logging
     const PAGE_LIMIT = 100;                          // max getAuthorFeed page size
     const PUBLIC_API = 'https://public.api.bsky.app'; // unauthenticated fallback
     const ACCENT = '#4aa8ff';
@@ -58,7 +59,13 @@
     const settings = {
         mode: GM_getValue(MODE_KEY, 'fullscreen'),
         size: GM_getValue(SIZE_KEY, 'medium'),
+        debug: GM_getValue(DEBUG_KEY, false),
     };
+
+    // Gated console logging - toggle via the settings modal (Debug logging).
+    function logDebug(...args) {
+        if (settings.debug) console.log('[Gallery Toggle]', ...args);
+    }
 
     // The page-realm fetch, captured before we patch it. We use this for our own
     // API calls so they don't recurse through our capture hook.
@@ -128,32 +135,38 @@
     /* ======================================================================
      * 2. API: getAuthorFeed?filter=posts_with_media, paginated by cursor.
      * ==================================================================== */
-    async function fetchMediaPage(actor, cursor) {
-        const params = new URLSearchParams({
-            actor: actor,
-            filter: 'posts_with_media',
-            limit: String(PAGE_LIMIT),
-        });
-        if (cursor) params.set('cursor', cursor);
-        const path = '/xrpc/app.bsky.feed.getAuthorFeed?' + params.toString();
+    async function fetchMediaPage(actor, cursor, filter) {
+        const buildPath = (f) => {
+            const params = new URLSearchParams({ actor: actor, filter: f, limit: String(PAGE_LIMIT) });
+            if (cursor) params.set('cursor', cursor);
+            return '/xrpc/app.bsky.feed.getAuthorFeed?' + params.toString();
+        };
 
-        // Preferred: replay the app's authenticated request.
-        if (auth.origin && auth.headers) {
-            try {
-                const res = await nativeFetch(auth.origin + path, {
-                    headers: auth.headers,
-                    credentials: 'omit',
-                });
-                if (res.ok) return res.json();
-            } catch (e) { /* fall through to public */ }
+        const fetchPath = async (path) => {
+            // Preferred: replay the app's authenticated request.
+            if (auth.origin && auth.headers) {
+                try {
+                    const res = await nativeFetch(auth.origin + path, { headers: auth.headers, credentials: 'omit' });
+                    if (res.ok) return res.json();
+                } catch (e) { /* fall through to public */ }
+            }
+            // Fallback: public AppView, no auth (default moderation applies).
+            const res = await nativeFetch(PUBLIC_API + path, { headers: { 'accept-language': navigator.language || 'en' } });
+            if (!res.ok) throw new Error('getAuthorFeed ' + res.status);
+            return res.json();
+        };
+
+        try {
+            return await fetchPath(buildPath(filter));
+        } catch (e) {
+            // Older AppViews may not know the posts_with_video filter; widen to all media
+            // (the caller still filters to videos client-side).
+            if (filter === 'posts_with_video') {
+                logDebug('filter "posts_with_video" failed (' + (e && e.message) + '); retrying posts_with_media');
+                return fetchPath(buildPath('posts_with_media'));
+            }
+            throw e;
         }
-
-        // Fallback: public AppView, no auth (default moderation applies).
-        const res = await nativeFetch(PUBLIC_API + path, {
-            headers: { 'accept-language': navigator.language || 'en' },
-        });
-        if (!res.ok) throw new Error('getAuthorFeed ' + res.status);
-        return res.json();
     }
 
     /* ======================================================================
@@ -270,15 +283,15 @@
      * 4. The grid + state.
      * ==================================================================== */
     const grid = {
-        actor: null, cursor: undefined, loading: false, done: false,
+        actor: null, videosOnly: false, cursor: undefined, loading: false, done: false,
         images: [], seen: null,
     };
     let rootEl, scrollEl, gridEl, sentinelEl, countEl, io, overlayKeyHandler;
-    let mountedMode = null, inlineHost = null;
+    let mountedMode = null, inlineHost = null, inlineResizeHandler = null;
 
     function buildHeader(actor) {
         const title = el('div', { class: 'bgt-title' }, actor.startsWith('did:') ? actor : '@' + actor);
-        const sub = el('div', { class: 'bgt-sub' }, 'Media gallery');
+        const sub = el('div', { class: 'bgt-sub' }, grid.videosOnly ? 'Video gallery' : 'Media gallery');
         countEl = el('div', { class: 'bgt-sub bgt-count' }, '');
 
         const closeBtn = el('button', { class: 'bgt-iconbtn', title: 'Close gallery (Esc)', onClick: closeGallery }, '✕');
@@ -296,16 +309,47 @@
         );
     }
 
-    // ---- find the in-line injection point (your selector first, then fallbacks) ----
+    function isOnScreen(elx) {
+        const r = elx.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && r.right > 0 && r.left < (window.innerWidth || 99999);
+    }
+
+    // ---- find the in-line injection point: the *visible* feed list of the active
+    //      pager panel. Profile tabs are a pager - each tab (Media/Videos/...) has its
+    //      own feed container and inactive ones are hidden/translated off-screen, so a
+    //      fixed structural selector lands on the wrong (hidden) tab. Pick the one
+    //      that's actually on screen. ----
     function findInlineHost() {
-        const r = document.querySelector('.r-2llsf');
-        if (r) {
+        // 1) The visible feed-list of the active pager panel (Bluesky uses .r-sa2ff0).
+        //    During a tab transition more than one can be partly on screen, so prefer
+        //    the most-centred one (the incoming/active panel).
+        const lists = Array.from(document.querySelectorAll('.r-sa2ff0')).filter(l =>
+            isOnScreen(l) && l.querySelector('[data-testid^="feedItem-by-"], img[src*="cdn.bsky.app"]'));
+        if (lists.length) {
+            const cx = (window.innerWidth || 0) / 2;
+            const dist = (l) => { const r = l.getBoundingClientRect(); return Math.abs((r.left + r.right) / 2 - cx); };
+            lists.sort((a, b) => dist(a) - dist(b));
+            return lists[0];
+        }
+        // 2) Walk up from a visible feed item to its .r-sa2ff0 list container.
+        const items = document.querySelectorAll('[data-testid^="feedItem-by-"]');
+        for (const it of items) {
+            if (!isOnScreen(it)) continue;
+            let node = it.parentElement;
+            while (node && node !== document.body) {
+                if (node.classList && node.classList.contains('r-sa2ff0')) return node;
+                node = node.parentElement;
+            }
+        }
+        // 3) Legacy structural fallback - only if it's actually on screen.
+        const root = document.querySelector('.r-2llsf');
+        if (root) {
             const tries = [
                 ':scope > div:nth-child(6) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(2) > div:nth-child(1)',
                 ':scope > div:nth-child(6)',
             ];
             for (const s of tries) {
-                try { const h = r.querySelector(s); if (h) return h; } catch (_) { /* bad selector */ }
+                try { const h = root.querySelector(s); if (h && isOnScreen(h)) return h; } catch (_) { /* bad selector */ }
             }
         }
         return null;
@@ -319,9 +363,55 @@
         mountedMode = 'fullscreen';
     }
 
+    // Height of Bluesky's pinned profile tab bar (Posts/Replies/Media/Videos), so the
+    // in-line header can stick just beneath it instead of overlapping it.
+    function stickyTabBarHeight() {
+        const tablist = document.querySelector('[role="tablist"]');
+        if (tablist) {
+            const h = Math.round(tablist.getBoundingClientRect().height);
+            if (h > 8 && h < 200) return h;
+        }
+        // Fallback: the sticky bar that sits directly above our grid in the profile column.
+        const r = document.querySelector('.r-2llsf');
+        if (r) {
+            for (const child of r.children) {
+                if (rootEl && child.contains(rootEl)) break; // reached our own row
+                if (getComputedStyle(child).position === 'sticky') {
+                    const h = Math.round(child.getBoundingClientRect().height);
+                    if (h > 8 && h < 200) return h;
+                }
+            }
+        }
+        return 0;
+    }
+
+    // The page surface colour, so the sticky header is opaque (tiles scroll cleanly
+    // under it) and matches light / dark / dim themes.
+    function surfaceBg() {
+        let p = rootEl ? rootEl.parentElement : null;
+        while (p && p !== document.documentElement) {
+            const bg = getComputedStyle(p).backgroundColor;
+            if (bg && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)') return bg;
+            p = p.parentElement;
+        }
+        return getComputedStyle(document.body).backgroundColor || '#161e27';
+    }
+
+    function applyInlineSticky() {
+        if (mountedMode !== 'inline' || !rootEl) return;
+        const header = rootEl.querySelector('.bgt-header');
+        if (!header) return;
+        header.style.position = 'sticky';
+        header.style.top = stickyTabBarHeight() + 'px';
+        header.style.zIndex = '5';
+        header.style.backgroundColor = surfaceBg();
+        logDebug('in-line sticky header: top=' + header.style.top + ' bg=' + header.style.backgroundColor);
+    }
+
     function mountInline(header) {
         const host = findInlineHost();
         if (!host || !host.parentNode) return false;
+        logDebug('mountInline host=' + (host.getAttribute('class') || host.tagName) + ' onScreen=' + isOnScreen(host));
         inlineHost = host;
         host.classList.add('bgt-feed-hidden');
         const inner = el('div', { class: 'bgt-inner bgt-inner-inline' }, gridEl, sentinelEl);
@@ -333,6 +423,9 @@
         // changes intersection against them and further pages never load.
         scrollEl = null;
         mountedMode = 'inline';
+        applyInlineSticky(); // pin our header beneath Bluesky's tab bar
+        inlineResizeHandler = () => applyInlineSticky();
+        window.addEventListener('resize', inlineResizeHandler);
         return true;
     }
 
@@ -388,18 +481,25 @@
         grid.loading = true;
         setSentinel('spin');
         try {
-            const data = await fetchMediaPage(grid.actor, grid.cursor);
+            const filter = grid.videosOnly ? 'posts_with_video' : 'posts_with_media';
+            logDebug('loadMore filter=' + filter + ' cursor=' + (grid.cursor || '(first page)'));
+            const data = await fetchMediaPage(grid.actor, grid.cursor, filter);
             grid.cursor = data.cursor;
             if (!data.cursor) grid.done = true;
 
             const tiles = [];
             (data.feed || []).forEach(item => {
                 if (item.reason && item.reason.$type === 'app.bsky.feed.defs#reasonRepost') return; // skip reposts
-                tilesFromPost(item.post).forEach(t => tiles.push(t));
+                tilesFromPost(item.post).forEach(t => {
+                    if (grid.videosOnly && t.kind !== 'video') return; // Videos tab: drop stills
+                    tiles.push(t);
+                });
             });
             appendTiles(tiles);
+            logDebug('page: +' + tiles.length + ' tiles, total=' + grid.seen.size + ', done=' + grid.done);
 
-            if (grid.done) setSentinel('text', grid.seen.size ? 'End of media' : 'No media found');
+            const noun = grid.videosOnly ? 'videos' : 'media';
+            if (grid.done) setSentinel('text', grid.seen.size ? 'End of ' + noun : 'No ' + noun + ' found');
             else setSentinel('none');
         } catch (e) {
             console.error('[Gallery Toggle] load failed:', e);
@@ -683,12 +783,39 @@
     /* ======================================================================
      * 6. Open / close / route sync.
      * ==================================================================== */
-    function currentProfileActor() {
-        const m = location.pathname.match(/^\/profile\/([^/]+)(?:\/(media|replies|likes|with_replies))?\/?$/);
-        return m ? decodeURIComponent(m[1]) : null;
+    // The profile tabs are a pager: clicking Posts/Media/Videos does NOT change the
+    // URL, so we read the active tab from the DOM. The selected tab's label holds an
+    // underline element with an inline background-colour; inactive tabs leave it empty.
+    function activeProfileTab() {
+        const labels = document.querySelectorAll('[data-testid^="profilePager-"]:not([data-testid^="profilePager-selector"])');
+        for (const lab of labels) {
+            if (lab.querySelector('[style*="background-color"]')) {
+                return (lab.getAttribute('data-testid') || '').replace('profilePager-', '').toLowerCase();
+            }
+        }
+        return null;
     }
 
-    let pendingHeader = null, waitingActor = null, mountObserver = null, mountTimer = null;
+    // The gallery only takes over the media-bearing tabs; Posts/Replies/Likes are left
+    // exactly as Bluesky renders them.
+    function tabUsesGallery(tab) { return tab === 'media' || tab === 'videos'; }
+
+    function currentProfileRoute() {
+        const m = location.pathname.match(/^\/profile\/([^/]+)(?:\/(media|video|videos|replies|likes|with_replies))?\/?$/);
+        if (!m) return null;
+        // Active tab from the DOM pager; fall back to the URL segment (deep links, or
+        // before the pager has painted).
+        let tab = activeProfileTab();
+        if (!tab) {
+            const seg = m[2];
+            if (seg === 'video' || seg === 'videos') tab = 'videos';
+            else if (seg === 'media') tab = 'media';
+            else tab = seg || 'posts';
+        }
+        return { actor: decodeURIComponent(m[1]), tab: tab };
+    }
+
+    let pendingHeader = null, waitingActor = null, waitingVideos = false, mountObserver = null, mountTimer = null;
 
     // The profile feed has to be painted before we can find the in-line anchor.
     // Treat it as ready once the feed host actually holds content (images, or the
@@ -698,12 +825,15 @@
         return !!(host && (host.querySelector('img') || host.querySelector('[data-testid^="feedItem-by-"]')));
     }
 
-    function openGallery(actor) {
-        if (rootEl && rootEl.isConnected && grid.actor === actor) return; // already showing this profile
-        if (!rootEl && waitingActor === actor) return;                    // already waiting to mount it
+    function openGallery(actor, videosOnly) {
+        videosOnly = !!videosOnly;
+        if (rootEl && rootEl.isConnected && grid.actor === actor && grid.videosOnly === videosOnly) return; // already showing this view
+        if (!rootEl && waitingActor === actor && waitingVideos === videosOnly) return;                       // already waiting to mount it
         removeOverlay();
 
+        logDebug('openGallery actor=' + actor + ' videosOnly=' + videosOnly + ' mode=' + settings.mode);
         grid.actor = actor;
+        grid.videosOnly = videosOnly;
         grid.cursor = undefined;
         grid.done = false;
         grid.loading = false;
@@ -712,12 +842,12 @@
 
         gridEl = el('div', { class: 'bgt-grid' });
         sentinelEl = el('div', { class: 'bgt-sentinel' }, el('div', { class: 'bgt-spinner' }));
-        pendingHeader = buildHeader(actor);
+        pendingHeader = buildHeader(actor); // reads grid.videosOnly, set just above
 
         if (settings.mode === 'inline') {
             // On a fresh load the feed isn't painted yet, so defer until it is.
             if (inlineReady() && mountInline(pendingHeader)) finishMount();
-            else waitForInlineHost(actor);
+            else waitForInlineHost(actor, videosOnly);
         } else {
             mountFullscreen(pendingHeader);
             finishMount();
@@ -738,8 +868,9 @@
         loadMore();
     }
 
-    function waitForInlineHost(actor) {
+    function waitForInlineHost(actor, videosOnly) {
         waitingActor = actor;
+        waitingVideos = videosOnly;
 
         // "Sit and watch" for the media feed to appear (e.g. when you switch to the
         // Media tab). Deliberately NO full-screen fallback and NO constant polling:
@@ -749,7 +880,7 @@
         // full-page grid just because the in-line anchor isn't on screen yet.
         const check = () => {
             mountTimer = null;
-            if (waitingActor !== actor || rootEl) { stopWaiting(); return; }
+            if (waitingActor !== actor || waitingVideos !== videosOnly || rootEl) { stopWaiting(); return; }
             if (inlineReady() && mountInline(pendingHeader)) {
                 stopWaiting();
                 finishMount();
@@ -774,6 +905,7 @@
 
     function removeOverlay() {
         stopWaiting();
+        if (inlineResizeHandler) { window.removeEventListener('resize', inlineResizeHandler); inlineResizeHandler = null; }
         pendingHeader = null;
         closeLightbox();
         if (lbEl) { lbEl.remove(); lbEl = null; }
@@ -787,9 +919,9 @@
     }
 
     function remountGallery() {
-        const actor = grid.actor || currentProfileActor();
+        const r = currentProfileRoute();
         removeOverlay();
-        if (galleryEnabled && actor) openGallery(actor);
+        if (galleryEnabled && r && tabUsesGallery(r.tab)) openGallery(r.actor, r.tab === 'videos');
     }
 
     function closeGallery() {
@@ -800,8 +932,8 @@
     }
 
     function syncGallery() {
-        const actor = currentProfileActor();
-        if (galleryEnabled && actor) openGallery(actor);
+        const r = currentProfileRoute();
+        if (galleryEnabled && r && tabUsesGallery(r.tab)) openGallery(r.actor, r.tab === 'videos');
         else removeOverlay();
         updateButtonState();
     }
@@ -824,7 +956,7 @@
         if (settings.mode === m) return;
         settings.mode = m;
         GM_setValue(MODE_KEY, m);
-        if (galleryEnabled && currentProfileActor()) remountGallery();
+        if (galleryEnabled && currentProfileRoute()) remountGallery();
     }
 
     function sizeChip(value, label) {
@@ -849,6 +981,12 @@
         root.style.setProperty('--bgt-tile-full', s.full);
     }
 
+    function setDebug(on) {
+        settings.debug = !!on;
+        GM_setValue(DEBUG_KEY, settings.debug);
+        console.log('[Gallery Toggle] debug logging ' + (settings.debug ? 'enabled' : 'disabled'));
+    }
+
     function openSettings() {
         if (document.getElementById(SETTINGS_ID)) return;
         const card = el('div', { class: 'bgt-settings-card' },
@@ -862,6 +1000,9 @@
                 sizeChip('medium', 'Medium'),
                 sizeChip('large', 'Large')),
             el('div', { class: 'bgt-settings-hint' }, 'In-line columns: 5 · 4 · 3'),
+            el('label', { class: 'bgt-debug-row' },
+                el('input', { type: 'checkbox', checked: settings.debug, onChange: (e) => setDebug(e.target.checked) }),
+                el('span', {}, 'Debug logging to console')),
             el('div', { class: 'bgt-settings-foot' }, el('button', { onClick: closeSettings }, 'Done'))
         );
         const backdrop = el('div', {
@@ -1080,6 +1221,8 @@
         #${SETTINGS_ID} .bgt-size-chip:hover { background: rgba(255,255,255,0.04); }
         #${SETTINGS_ID} .bgt-size-chip input { accent-color: #0085ff; }
         #${SETTINGS_ID} .bgt-settings-hint { font-size: 12px; color: #8b98a5; margin: 8px 2px 2px; }
+        #${SETTINGS_ID} .bgt-debug-row { display: flex; align-items: center; gap: 8px; margin-top: 14px; font-size: 13px; color: #c3ccd6; cursor: pointer; }
+        #${SETTINGS_ID} .bgt-debug-row input { accent-color: #0085ff; }
         #${SETTINGS_ID} .bgt-settings-foot { display: flex; justify-content: flex-end; margin-top: 12px; }
         #${SETTINGS_ID} .bgt-settings-foot button {
             background: #0085ff; color: #fff; border: none; border-radius: 8px;
@@ -1107,8 +1250,14 @@
         unsafeWindow.addEventListener('popstate', onRouteChange);
     }
 
-    let lastHref = location.href;
+    let lastSig = '';
+    function routeSig() {
+        const r = currentProfileRoute();
+        return location.href + '|' + (r ? r.tab : '-');
+    }
     function onRouteChange() {
+        lastSig = routeSig();
+        logDebug('route/tab change -> ' + lastSig);
         ensureButton();
         syncGallery();
     }
@@ -1128,9 +1277,11 @@
         new MutationObserver(updateButtonState)
             .observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
 
-        // Safety-net route watcher (covers any navigation the history hook misses).
+        // Watches for navigation AND profile tab switches. The Media/Videos pager
+        // doesn't change the URL, so href alone isn't enough - routeSig() also folds
+        // in the active-tab state.
         setInterval(() => {
-            if (location.href !== lastHref) { lastHref = location.href; onRouteChange(); }
+            if (routeSig() !== lastSig) onRouteChange();
         }, 500);
 
         syncGallery();
