@@ -5,7 +5,7 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.1.2
+// @version      2.2.0
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -26,9 +26,18 @@
     const SETTINGS_ID = 'bsky-gallery-settings';
     const STORAGE_KEY = 'bsky-gallery-enabled';
     const MODE_KEY = 'bsky-gallery-mode';            // 'fullscreen' | 'inline'
+    const SIZE_KEY = 'bsky-gallery-size';            // 'small' | 'medium' | 'large'
     const PAGE_LIMIT = 100;                          // max getAuthorFeed page size
     const PUBLIC_API = 'https://public.api.bsky.app'; // unauthenticated fallback
     const ACCENT = '#4aa8ff';
+
+    // Tile min-width per size. Tuned so in-line lands on ~5 / 4 / 3 columns
+    // (Large ≈ x.com's 3-across); full-screen is wider so it shows more.
+    const SIZES = {
+        small:  { inline: '100px', full: '120px' },
+        medium: { inline: '120px', full: '150px' },
+        large:  { inline: '170px', full: '210px' },
+    };
 
     const ICON_GRID = 'M2 6a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6zm2 0v4h4V6H4zm10-2h4a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm0 2v4h4V6h-4zM2 16a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-4zm2 0v4h4v-4H4zm10-2h4a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-4a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2zm0 2v4h4v-4h-4z';
     const ICON_GEAR = 'M19.14 12.94c.04-.3.06-.62.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.48.48 0 0 0-.59.22L2.74 8.87a.48.48 0 0 0 .12.61l2.03 1.58c-.05.3-.07.62-.07.94 0 .32.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.13.22.39.3.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.03-1.58zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2z';
@@ -36,7 +45,10 @@
     const ICON_PLAY = 'M8 5v14l11-7z';
 
     let galleryEnabled = GM_getValue(STORAGE_KEY, false);
-    const settings = { mode: GM_getValue(MODE_KEY, 'fullscreen') };
+    const settings = {
+        mode: GM_getValue(MODE_KEY, 'fullscreen'),
+        size: GM_getValue(SIZE_KEY, 'medium'),
+    };
 
     // The page-realm fetch, captured before we patch it. We use this for our own
     // API calls so they don't recurse through our capture hook.
@@ -389,10 +401,12 @@
             close, lbPrev, el('div', { class: 'bgt-lb-stage' }, lbImg), lbNext, bar);
         document.body.appendChild(lbEl);
 
+        // stopImmediatePropagation + window-capture so we win over Bluesky's own
+        // arrow-key shortcuts (which listen on document and would otherwise eat them).
         lbKeyHandler = (e) => {
-            if (e.key === 'Escape') { e.stopPropagation(); closeLightbox(); }
-            else if (e.key === 'ArrowLeft') { e.stopPropagation(); navLightbox(-1); }
-            else if (e.key === 'ArrowRight') { e.stopPropagation(); navLightbox(1); }
+            if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); closeLightbox(); }
+            else if (e.key === 'ArrowLeft') { e.preventDefault(); e.stopImmediatePropagation(); navLightbox(-1); }
+            else if (e.key === 'ArrowRight') { e.preventDefault(); e.stopImmediatePropagation(); navLightbox(1); }
         };
     }
 
@@ -412,7 +426,7 @@
         lbIndex = i;
         showLightbox();
         lbEl.style.display = 'flex';
-        document.addEventListener('keydown', lbKeyHandler, true);
+        unsafeWindow.addEventListener('keydown', lbKeyHandler, true);
     }
 
     function navLightbox(d) {
@@ -427,7 +441,7 @@
         if (!lbEl) return;
         lbEl.style.display = 'none';
         lbImg.src = '';
-        document.removeEventListener('keydown', lbKeyHandler, true);
+        unsafeWindow.removeEventListener('keydown', lbKeyHandler, true);
     }
 
     /* ======================================================================
@@ -572,6 +586,28 @@
         if (galleryEnabled && currentProfileActor()) remountGallery();
     }
 
+    function sizeChip(value, label) {
+        const input = el('input', {
+            type: 'radio', name: 'bgt-size', value: value, checked: settings.size === value,
+            onChange: () => setSize(value),
+        });
+        return el('label', { class: 'bgt-size-chip' }, input, label);
+    }
+
+    function setSize(s) {
+        if (settings.size === s) return;
+        settings.size = s;
+        GM_setValue(SIZE_KEY, s);
+        applySize(); // live: just swaps CSS vars, no rebuild needed
+    }
+
+    function applySize() {
+        const s = SIZES[settings.size] || SIZES.medium;
+        const root = document.documentElement;
+        root.style.setProperty('--bgt-tile-inline', s.inline);
+        root.style.setProperty('--bgt-tile-full', s.full);
+    }
+
     function openSettings() {
         if (document.getElementById(SETTINGS_ID)) return;
         const card = el('div', { class: 'bgt-settings-card' },
@@ -579,6 +615,12 @@
             el('div', { class: 'bgt-settings-sub' }, 'How should the media grid appear?'),
             modeRow('fullscreen', 'Full screen', 'Takes over the whole window (default). Most reliable.'),
             modeRow('inline', 'In-line', 'Embeds the grid in the profile page, keeping the sidebar and header. Depends on Bluesky’s layout, so it may fall back to full screen.'),
+            el('div', { class: 'bgt-settings-label' }, 'Tile size'),
+            el('div', { class: 'bgt-size-group' },
+                sizeChip('small', 'Small'),
+                sizeChip('medium', 'Medium'),
+                sizeChip('large', 'Large')),
+            el('div', { class: 'bgt-settings-hint' }, 'In-line columns: 5 · 4 · 3'),
             el('div', { class: 'bgt-settings-foot' }, el('button', { onClick: closeSettings }, 'Done'))
         );
         const backdrop = el('div', {
@@ -693,7 +735,7 @@
         #${OVERLAY_ID} .bgt-scroll { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; }
         #${OVERLAY_ID} .bgt-inner { max-width: 1200px; margin: 0 auto; padding: 8px; }
         #${OVERLAY_ID} .bgt-grid {
-            display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 3px;
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--bgt-tile-full, 150px), 1fr)); gap: 3px;
         }
         #${OVERLAY_ID} .bgt-tile {
             position: relative; aspect-ratio: 1 / 1; overflow: hidden; background: #11171f;
@@ -726,7 +768,7 @@
         #${OVERLAY_ID}.bgt-inline .bgt-header { background: transparent; color: inherit; border-bottom: 1px solid rgba(127,127,127,0.25); }
         #${OVERLAY_ID}.bgt-inline .bgt-title, #${OVERLAY_ID}.bgt-inline .bgt-iconbtn { color: inherit; }
         #${OVERLAY_ID}.bgt-inline .bgt-inner-inline { max-width: none; margin: 0; padding: 6px; }
-        #${OVERLAY_ID}.bgt-inline .bgt-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
+        #${OVERLAY_ID}.bgt-inline .bgt-grid { grid-template-columns: repeat(auto-fill, minmax(var(--bgt-tile-inline, 120px), 1fr)); }
         .bgt-feed-hidden { display: none !important; }
 
         /* ---- lightbox ---- */
@@ -772,7 +814,17 @@
         #${SETTINGS_ID} .bgt-radio input { margin-top: 3px; accent-color: #0085ff; }
         #${SETTINGS_ID} .bgt-radio-label { font-size: 15px; font-weight: 600; }
         #${SETTINGS_ID} .bgt-radio-desc { font-size: 12.5px; color: #8b98a5; margin-top: 2px; }
-        #${SETTINGS_ID} .bgt-settings-foot { display: flex; justify-content: flex-end; margin-top: 6px; }
+        #${SETTINGS_ID} .bgt-settings-label { font-size: 13px; color: #8b98a5; margin: 12px 0 8px; }
+        #${SETTINGS_ID} .bgt-size-group { display: flex; gap: 8px; }
+        #${SETTINGS_ID} .bgt-size-chip {
+            flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px;
+            padding: 9px 6px; border: 1px solid #2a3743; border-radius: 10px; cursor: pointer;
+            font-size: 14px; font-weight: 600;
+        }
+        #${SETTINGS_ID} .bgt-size-chip:hover { background: rgba(255,255,255,0.04); }
+        #${SETTINGS_ID} .bgt-size-chip input { accent-color: #0085ff; }
+        #${SETTINGS_ID} .bgt-settings-hint { font-size: 12px; color: #8b98a5; margin: 8px 2px 2px; }
+        #${SETTINGS_ID} .bgt-settings-foot { display: flex; justify-content: flex-end; margin-top: 12px; }
         #${SETTINGS_ID} .bgt-settings-foot button {
             background: #0085ff; color: #fff; border: none; border-radius: 8px;
             padding: 8px 18px; font-size: 14px; font-weight: 600; cursor: pointer;
@@ -807,6 +859,7 @@
 
     function startDom() {
         injectStyles();
+        applySize();
         ensureButton();
         hookHistory();
 
