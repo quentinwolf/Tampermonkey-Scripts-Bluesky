@@ -5,7 +5,7 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.5.3
+// @version      2.5.4
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -1214,13 +1214,16 @@
         #${LIGHTBOX_ID} .bgt-lb-prev { left: 14px; }
         #${LIGHTBOX_ID} .bgt-lb-next { right: 14px; }
         #${LIGHTBOX_ID} .bgt-lb-bar {
-            position: absolute; left: 0; right: 0; bottom: 0; padding: 32px 18px 12px;
-            display: flex; flex-direction: column; gap: 28px; color: #e6e9ec; font-size: 14px;
+            position: absolute; left: 0; right: 0; bottom: 0; padding: 20px 18px 14px;
+            display: flex; flex-direction: column; gap: 10px; color: #e6e9ec; font-size: 14px;
             background: linear-gradient(transparent, rgba(0,0,0,0.88));
             /* keep white text readable over light images, not just the gradient */
             text-shadow: 0 1px 3px rgba(0,0,0,0.95), 0 0 4px rgba(0,0,0,0.85);
         }
-        #${LIGHTBOX_ID} .bgt-lb-actions { display: flex; align-items: center; justify-content: center; gap: 6px; }
+        /* Post text + alt caption sit close (10px gap); the action row gets its own
+           clear separation above it, so the gap above the buttons is consistent whether
+           or not the optional text blocks are showing. */
+        #${LIGHTBOX_ID} .bgt-lb-actions { display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 14px; }
         #${LIGHTBOX_ID} .bgt-lb-text, #${LIGHTBOX_ID} .bgt-lb-cap {
             display: none; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere;
             overflow-y: auto; width: 50%; max-width: 450px; margin: 0 auto; line-height: 1.4;
