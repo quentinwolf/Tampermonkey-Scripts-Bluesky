@@ -5,7 +5,7 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.7.7
+// @version      2.7.9
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -39,6 +39,8 @@
     const PAGE_LIMIT = 100;                          // max getAuthorFeed page size
     const PUBLIC_API = 'https://public.api.bsky.app'; // unauthenticated fallback
     const ACCENT = '#4aa8ff';
+    const LB_PREFETCH_AHEAD = 5;                     // lightbox: warm this many upcoming full-size images
+    const LB_PREFETCH_CACHE = 12;                    // lightbox: cap on retained prefetched images (memory bound)
 
     // Tile min-width per size. Tuned so in-line lands on ~5 / 4 / 3 columns
     // (Large ≈ x.com's 3-across); full-screen is wider so it shows more.
@@ -528,6 +530,7 @@
             });
             appendTiles(tiles);
             logDebug('page: +' + tiles.length + ' tiles, total=' + grid.seen.size + ', done=' + grid.done);
+            if (lbEl && lbEl.style.display !== 'none') prefetchNeighbors(); // warm the freshly-loaded page for the open lightbox
 
             const noun = grid.videosOnly ? 'videos' : 'media';
             if (grid.done) setSentinel('text', grid.seen.size ? 'End of ' + noun : 'No ' + noun + ' found');
@@ -706,7 +709,10 @@
      * ==================================================================== */
     let lbEl, lbImg, lbVideo, lbHls, lbCap, lbLink, lbPrev, lbNext, lbIndex = 0, lbKeyHandler;
     let lbActionsRow, lbReply, lbRepost, lbLike, lbBookmark, lbPostText, lbTime, lbThumbs;
+    let lbLoading, lbLoadingSpin, lbLoadingText; // "Loading media…" overlay while an image decodes
     let thumbsRange = null; // [lo,hi] of items currently rendered in the thumbnail strip
+    let lbLastDir = 1;            // last lightbox nav direction (+1 next / -1 prev), to bias prefetch
+    const lbPrefetch = new Map(); // url -> Image: bounded buffer of warmed upcoming full-size images
 
     // Build one action button. `withCount` adds a live counter; like/bookmark pass a
     // second path so the icon can swap to its filled variant when active.
@@ -802,8 +808,14 @@
         lbThumbs = el('div', { class: 'bgt-lb-thumbs' });
         thumbsRange = null; // fresh element, so force a rebuild on the first show
 
+        // Centred "Loading media…" overlay, shown while a freshly-navigated image is
+        // still decoding so the previous picture isn't left on screen in the meantime.
+        lbLoadingSpin = el('div', { class: 'bgt-spinner' });
+        lbLoadingText = el('div', { class: 'bgt-lb-loading-text' }, 'Loading media…');
+        lbLoading = el('div', { class: 'bgt-lb-loading' }, lbLoadingSpin, lbLoadingText);
+
         lbEl = el('div', { id: LIGHTBOX_ID, onClick: (e) => { if (e.target === lbEl) closeLightbox(); } },
-            close, lbThumbs, lbPrev, el('div', { class: 'bgt-lb-stage' }, lbImg, lbVideo), lbNext, bar);
+            close, lbThumbs, lbPrev, el('div', { class: 'bgt-lb-stage' }, lbImg, lbVideo, lbLoading), lbNext, bar);
         document.body.appendChild(lbEl);
 
         // Mouse-wheel (navigate / flip thumbnails / zoom) + cursor-follow pan. Both are
@@ -821,6 +833,23 @@
         };
     }
 
+    // Loading overlay: spinner + "Loading media…" while a navigated-to image decodes.
+    function showLbLoading() {
+        if (!lbLoading) return;
+        lbLoadingSpin.style.display = 'block';
+        lbLoadingText.textContent = 'Loading media…';
+        lbLoading.style.display = 'flex';
+    }
+    function hideLbLoading() {
+        if (lbLoading) lbLoading.style.display = 'none';
+    }
+    function lbLoadError() {
+        if (!lbLoading) return;
+        lbLoadingSpin.style.display = 'none';
+        lbLoadingText.textContent = 'Could not load media';
+        lbLoading.style.display = 'flex';
+    }
+
     function showLightbox() {
         const it = grid.items[lbIndex];
         if (!it) return;
@@ -829,6 +858,7 @@
         const isVideo = it.kind === 'video';
         lbEl.classList.toggle('bgt-has-video', isVideo);
         if (isVideo) {
+            hideLbLoading(); // video uses its own poster; no image-decode wait
             lbImg.style.display = 'none';
             lbImg.removeAttribute('src');
             lbVideo.style.display = 'block';
@@ -843,9 +873,17 @@
         } else {
             lbVideo.style.display = 'none';
             lbImg.style.display = 'block';
-            lbImg.src = it.full;
             lbImg.alt = it.alt || '';
             lbImg.style.cursor = (settings.wheel && settings.wheelAction === 'zoom') ? 'zoom-in' : '';
+            // Hide the just-shown image and show the loader until the new one decodes, so
+            // fast wheel-navigation never lingers on the previous picture. onload reveals
+            // it; a cached image is already complete, so we reveal instantly (no flash).
+            lbImg.classList.remove('bgt-loaded');
+            showLbLoading();
+            lbImg.onload = () => { lbImg.classList.add('bgt-loaded'); hideLbLoading(); };
+            lbImg.onerror = () => lbLoadError();
+            lbImg.src = it.full;
+            if (lbImg.complete && lbImg.naturalWidth > 0) { lbImg.classList.add('bgt-loaded'); hideLbLoading(); }
         }
         lbLink.href = it.url;
         updateNavButtons();
@@ -853,6 +891,11 @@
         applyPostInfo();
         applyAltText();
         applyThumbs();
+        // Pull the next page before nav (and the buffer) hit the end of what's loaded -
+        // index-driven, so it works even when the grid behind is scrolled out of view
+        // (unlike the viewport-gated maybeLoadMore). loadMore() no-ops if busy/done.
+        if (settings.continuousNav && grid.items.length - lbIndex <= LB_PREFETCH_AHEAD + 2) loadMore();
+        prefetchNeighbors(); // warm the next few full-size images so fast nav doesn't wait on each
     }
 
     // Items from one post share a postState object reference (set once per post in
@@ -989,8 +1032,54 @@
         lbCap.style.display = alt ? 'block' : 'none';
     }
 
+    /* ---- lightbox image prefetch -------------------------------------------------
+     * Grid tiles only load thumbnails; the lightbox shows `full` (a different, larger
+     * URL), so scrolling fast past the loaded region means each full image is a cold
+     * fetch. Keep a small buffer of upcoming `full` images warm in the browser's HTTP
+     * cache so showing them is near-instant. Bounded by LB_PREFETCH_CACHE for memory.
+     * ----------------------------------------------------------------------------- */
+    function warmImage(url) {
+        if (!url) return;
+        if (lbPrefetch.has(url)) {                    // LRU touch: move to the freshest slot
+            const v = lbPrefetch.get(url);
+            lbPrefetch.delete(url);
+            lbPrefetch.set(url, v);
+            return;
+        }
+        const img = new Image();
+        img.decoding = 'async';
+        img.src = url;                                // browser fetches into its HTTP cache; lbImg reuses it
+        lbPrefetch.set(url, img);
+        while (lbPrefetch.size > LB_PREFETCH_CACHE) { // evict oldest beyond the cap
+            const oldest = lbPrefetch.keys().next().value;
+            lbPrefetch.delete(oldest);
+        }
+    }
+
+    // Only still images have a `full` worth warming; videos stream via HLS and their
+    // poster is the thumb already loaded by the grid.
+    function prefetchItem(it) {
+        if (it && it.kind === 'image' && it.full) warmImage(it.full);
+    }
+
+    // Warm LB_PREFETCH_AHEAD images in the direction of travel (plus one behind, for a
+    // quick reversal), clamped to the range the arrows can actually reach.
+    function prefetchNeighbors() {
+        if (!grid.items.length) return;
+        const [lo, hi] = navBounds();
+        const dir = lbLastDir < 0 ? -1 : 1;
+        for (let k = 1; k <= LB_PREFETCH_AHEAD; k++) {
+            const i = lbIndex + dir * k;
+            if (i < lo || i > hi) break;
+            prefetchItem(grid.items[i]);
+        }
+        const back = lbIndex - dir;
+        if (back >= lo && back <= hi) prefetchItem(grid.items[back]);
+    }
+
     function openLightbox(i) {
         if (!lbEl) buildLightbox();
+        lbLastDir = 1; // fresh open: bias the buffer forward
         lbIndex = i;
         showLightbox();
         lbEl.style.display = 'flex';
@@ -1001,9 +1090,9 @@
         const [lo, hi] = navBounds();
         const n = lbIndex + d;
         if (n < lo || n > hi) return; // off the end of the gallery, or of the post group
+        lbLastDir = d < 0 ? -1 : 1;   // bias the prefetch buffer toward the way we're moving
         lbIndex = n;
-        showLightbox();
-        if (settings.continuousNav && n >= grid.items.length - 4) maybeLoadMore(); // keep nav going near the end
+        showLightbox();               // showLightbox tops up the page + prefetch buffer near the end
     }
 
     // Step strictly within the current post's image group, regardless of the
@@ -1012,6 +1101,7 @@
         const [lo, hi] = postGroupRange(lbIndex);
         const n = lbIndex + d;
         if (n < lo || n > hi) return;
+        lbLastDir = d < 0 ? -1 : 1;
         lbIndex = n;
         showLightbox();
     }
@@ -1103,6 +1193,7 @@
         teardownVideo();
         lbEl.style.display = 'none';
         lbImg.src = '';
+        lbPrefetch.clear(); // release the buffer's Image refs; the HTTP cache still holds the bytes
         unsafeWindow.removeEventListener('keydown', lbKeyHandler, true);
     }
 
@@ -1579,7 +1670,16 @@
             display: none; align-items: center; justify-content: center;
         }
         #${LIGHTBOX_ID} .bgt-lb-stage { display: flex; align-items: center; justify-content: center; overflow: hidden; }
-        #${LIGHTBOX_ID} .bgt-lbimg { max-width: 94vw; max-height: 90vh; object-fit: contain; border-radius: 4px; }
+        #${LIGHTBOX_ID} .bgt-lbimg { max-width: 94vw; max-height: 90vh; object-fit: contain; border-radius: 4px; opacity: 0; }
+        /* Revealed only once the new image has decoded (set in showLightbox), so a
+           navigation shows the loader instead of the previous, still-displayed picture. */
+        #${LIGHTBOX_ID} .bgt-lbimg.bgt-loaded { opacity: 1; }
+        /* Centred over the stage; shown while the next image decodes. */
+        #${LIGHTBOX_ID} .bgt-lb-loading {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            display: none; flex-direction: column; align-items: center; gap: 12px;
+            color: #c3ccd6; font-size: 14px; font-weight: 600; z-index: 2; pointer-events: none;
+        }
         #${LIGHTBOX_ID} .bgt-lbvideo { max-width: 94vw; max-height: 90vh; object-fit: contain; border-radius: 4px; background: #000; }
         /* A definite box, sized by the video's aspect ratio, so the player fills the
            stage and upscales a low starting rendition (object-fit) instead of shrinking
