@@ -5,7 +5,7 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.5.4
+// @version      2.5.5
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -191,6 +191,9 @@
         return {
             uri: post.uri, cid: post.cid, url: postUrl(post),
             text: (post.record && typeof post.record.text === 'string') ? post.record.text : '',
+            // Authored time, straight off the feed payload (no extra API call). Falls
+            // back to the AppView's indexedAt if a record somehow lacks createdAt.
+            createdAt: (post.record && post.record.createdAt) || post.indexedAt || '',
             replyCount: post.replyCount || 0,
             repostCount: post.repostCount || 0,
             likeCount: post.likeCount || 0,
@@ -584,6 +587,16 @@
         const v = n / 1e6; return (v >= 100 ? Math.round(v) : Math.round(v * 10) / 10) + 'M';
     }
 
+    // Bluesky-style post stamp: "1:59 PM · May 21, 2026" (uses the viewer's locale).
+    function fmtPostTime(iso) {
+        if (!iso) return '';
+        const d = new Date(iso);
+        if (isNaN(d.getTime())) return '';
+        const time = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+        const date = d.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
+        return time + ' · ' + date;
+    }
+
     // Each toggle flips the UI optimistically, fires the write, and rolls back on
     // failure. Without a writable session we just open the post so the user can act
     // natively. A busy flag guards against double-taps racing the network.
@@ -669,7 +682,7 @@
      * 5. Lightbox for images (videos/gifs open the post instead).
      * ==================================================================== */
     let lbEl, lbImg, lbCap, lbLink, lbPrev, lbNext, lbIndex = 0, lbKeyHandler;
-    let lbActionsRow, lbReply, lbRepost, lbLike, lbBookmark, lbPostText;
+    let lbActionsRow, lbReply, lbRepost, lbLike, lbBookmark, lbPostText, lbTime;
 
     // Build one action button. `withCount` adds a live counter; like/bookmark pass a
     // second path so the icon can swap to its filled variant when active.
@@ -715,6 +728,12 @@
         lbBookmark.btn.classList.toggle('bgt-on', !!st.bookmarked);
         lbBookmark.path.setAttribute('d', st.bookmarked ? ICON_BOOKMARK_FILLED : ICON_BOOKMARK);
         lbBookmark.btn.title = !canWrite ? 'Save (opens post)' : (st.bookmarked ? 'Remove bookmark' : 'Save');
+
+        if (lbTime) {
+            const stamp = fmtPostTime(st.createdAt);
+            lbTime.textContent = stamp;
+            lbTime.title = stamp ? new Date(st.createdAt).toLocaleString() : '';
+        }
     }
 
     function buildLightbox() {
@@ -729,8 +748,10 @@
         lbRepost = lbActButton('repost', ICON_REPOST, true, () => toggleRepost(curPostState()));
         lbLike = lbActButton('like', ICON_HEART, true, () => toggleLike(curPostState()));
         lbBookmark = lbActButton('bookmark', ICON_BOOKMARK, false, () => toggleBookmark(curPostState()));
+        // Muted post timestamp, sits just before the Open-post link.
+        lbTime = el('span', { class: 'bgt-lb-time' });
         lbActionsRow = el('div', { class: 'bgt-lb-actions' },
-            lbReply.btn, lbRepost.btn, lbLike.btn, lbBookmark.btn, lbLink);
+            lbReply.btn, lbRepost.btn, lbLike.btn, lbBookmark.btn, lbTime, lbLink);
 
         // Action row is pinned LAST so it stays anchored to the bottom; post text and
         // alt caption stack ABOVE it. That way toggling the alt caption pushes the post
@@ -1223,7 +1244,9 @@
         /* Post text + alt caption sit close (10px gap); the action row gets its own
            clear separation above it, so the gap above the buttons is consistent whether
            or not the optional text blocks are showing. */
-        #${LIGHTBOX_ID} .bgt-lb-actions { display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 14px; }
+        #${LIGHTBOX_ID} .bgt-lb-actions { display: flex; align-items: center; justify-content: center; gap: 11px; margin-top: 14px; }
+        #${LIGHTBOX_ID} .bgt-lb-time { color: #8b98a5; font-size: 13px; white-space: nowrap; }
+        #${LIGHTBOX_ID} .bgt-lb-time:empty { display: none; }
         #${LIGHTBOX_ID} .bgt-lb-text, #${LIGHTBOX_ID} .bgt-lb-cap {
             display: none; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere;
             overflow-y: auto; width: 50%; max-width: 450px; margin: 0 auto; line-height: 1.4;
