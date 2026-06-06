@@ -5,7 +5,7 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.6.2
+// @version      2.6.3
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -1380,16 +1380,23 @@
             background: linear-gradient(transparent, rgba(0,0,0,0.88));
             /* keep white text readable over light images, not just the gradient */
             text-shadow: 0 1px 3px rgba(0,0,0,0.95), 0 0 4px rgba(0,0,0,0.85);
+            /* The bar spans the bottom, but only its controls should be clickable -
+               let clicks on the empty gradient fall through to the backdrop (close). */
+            pointer-events: none;
         }
         /* Post text + alt caption sit close (10px gap); the action row gets its own
            clear separation above it, so the gap above the buttons is consistent whether
            or not the optional text blocks are showing. */
-        #${LIGHTBOX_ID} .bgt-lb-actions { display: flex; align-items: center; justify-content: center; gap: 11px; margin-top: 14px; }
+        /* align-self:center shrinks the row to its buttons so the empty corners beside
+           it belong to the (click-through) bar, not the row; pointer-events:auto keeps
+           the cluster - buttons, timestamp, gaps, link - from closing the lightbox. */
+        #${LIGHTBOX_ID} .bgt-lb-actions { display: flex; align-self: center; align-items: center; justify-content: center; gap: 11px; margin-top: 14px; pointer-events: auto; }
         #${LIGHTBOX_ID} .bgt-lb-time { color: #8b98a5; font-size: 13px; white-space: nowrap; }
         #${LIGHTBOX_ID} .bgt-lb-time:empty { display: none; }
         #${LIGHTBOX_ID} .bgt-lb-text, #${LIGHTBOX_ID} .bgt-lb-cap {
             display: none; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere;
             overflow-y: auto; width: 50%; max-width: 450px; margin: 0 auto; line-height: 1.4;
+            pointer-events: auto; /* scrollable/selectable text shouldn't close on click */
         }
         #${LIGHTBOX_ID} .bgt-lb-text { max-height: 22vh; font-size: 14px; color: #f1f3f5; }
         #${LIGHTBOX_ID} .bgt-lb-cap { max-height: 14vh; font-size: 13px; color: #d2d9e0; }
