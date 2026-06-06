@@ -4,7 +4,7 @@
 // @author       @quentinwolf.ca
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.8.5
+// @version      2.8.6
 // @license      GPL-3.0-or-later
 // @match        *://bsky.app/*
 // @run-at       document-start
@@ -2058,8 +2058,15 @@
             position: fixed; inset: 0; z-index: 99999; background: rgba(0,0,0,0.93);
             display: none; align-items: center; justify-content: center;
         }
-        #${LIGHTBOX_ID} .bgt-lb-stage { display: flex; align-items: center; justify-content: center; overflow: hidden; }
-        #${LIGHTBOX_ID} .bgt-lbimg { max-width: 94vw; max-height: 90vh; object-fit: contain; border-radius: 4px; opacity: 0; }
+        /* The stage is a fixed band the media scales/centres within: top/bottom set its
+           edges (held clear of the top controls and the bottom action bar), and the
+           image/video is then sized to fit inside it. The thumbnail case below just
+           drops the top edge to make room for the strip - same band, different edges. */
+        #${LIGHTBOX_ID} .bgt-lb-stage {
+            position: absolute; left: 0; right: 0; top: 60px; bottom: 60px;
+            display: flex; align-items: center; justify-content: center; overflow: hidden;
+        }
+        #${LIGHTBOX_ID} .bgt-lbimg { max-width: 94vw; max-height: 100%; object-fit: contain; border-radius: 4px; opacity: 0; }
         /* Revealed only once the new image has decoded (set in showLightbox), so a
            navigation shows the loader instead of the previous, still-displayed picture. */
         #${LIGHTBOX_ID} .bgt-lbimg.bgt-loaded { opacity: 1; }
@@ -2115,8 +2122,10 @@
         #${LIGHTBOX_ID} .bgt-lb-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
         #${LIGHTBOX_ID} .bgt-lb-thumb:hover { opacity: 0.85; }
         #${LIGHTBOX_ID} .bgt-lb-thumb.bgt-on { opacity: 1; border-color: ${ACCENT}; }
-        /* Keep the image clear of the strip (and the bottom bar) while it's showing. */
-        #${LIGHTBOX_ID}.bgt-has-thumbs .bgt-lbimg { max-height: calc(100vh - 280px); }
+        /* Thumbnail strip showing: drop the band's top edge below it (and give the bottom
+           a touch more clearance). The base stage rule already centres and scales the
+           media within whatever band these edges define. */
+        #${LIGHTBOX_ID}.bgt-has-thumbs .bgt-lb-stage { top: 140px; bottom: 60px; }
         #${LIGHTBOX_ID} .bgt-lb-bar {
             position: absolute; left: 0; right: 0; bottom: 0; padding: 20px 18px 14px;
             display: flex; flex-direction: column; gap: 10px; color: #e6e9ec; font-size: 14px;
@@ -2133,7 +2142,7 @@
         /* align-self:center shrinks the row to its buttons so the empty corners beside
            it belong to the (click-through) bar, not the row; pointer-events:auto keeps
            the cluster - buttons, timestamp, gaps, link - from closing the lightbox. */
-        #${LIGHTBOX_ID} .bgt-lb-actions { display: flex; align-self: center; align-items: center; justify-content: center; gap: 11px; margin-top: 14px; pointer-events: auto; }
+        #${LIGHTBOX_ID} .bgt-lb-actions { display: flex; align-self: center; align-items: center; justify-content: center; gap: 11px; margin-top: 12px; pointer-events: auto; }
         #${LIGHTBOX_ID} .bgt-lb-time { color: #8b98a5; font-size: 13px; white-space: nowrap; }
         #${LIGHTBOX_ID} .bgt-lb-time:empty { display: none; }
         #${LIGHTBOX_ID} .bgt-lb-text, #${LIGHTBOX_ID} .bgt-lb-cap {
@@ -2141,7 +2150,7 @@
             overflow-y: auto; width: 50%; max-width: 450px; margin: 0 auto; line-height: 1.4;
             pointer-events: auto; /* scrollable/selectable text shouldn't close on click */
         }
-        #${LIGHTBOX_ID} .bgt-lb-text { max-height: 22vh; font-size: 14px; color: #f1f3f5; }
+        #${LIGHTBOX_ID} .bgt-lb-text { max-height: 22vh; font-size: 14px; color: #f1f3f5; line-height: 0.9; }
         #${LIGHTBOX_ID} .bgt-lb-cap { max-height: 14vh; font-size: 13px; color: #d2d9e0; }
         #${LIGHTBOX_ID} .bgt-lb-post { color: #4aa8ff; text-decoration: none; white-space: nowrap; }
         #${LIGHTBOX_ID} .bgt-lb-text a.bgt-lb-link, #${LIGHTBOX_ID} .bgt-lb-cap a.bgt-lb-link {
