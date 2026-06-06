@@ -4,14 +4,14 @@
 // @author       @quentinwolf.ca
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.8.3
+// @version      2.8.4
 // @license      GPL-3.0-or-later
 // @match        *://bsky.app/*
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        unsafeWindow
-// @require      https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js    // for in-lightbox video playback (including .m3u8 from the API and Tenor/Giphy GIFs that come in as external embeds)
+// @require      https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js
 // @downloadURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
 // @updateURL    https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
 // ==/UserScript==
@@ -1191,11 +1191,89 @@
         unsafeWindow.open(it.url, '_blank', 'noopener');
     }
 
+    /* ---- linkify caption / post text --------------------------------------------
+     * Post text and alt captions arrive as plain strings (alt has no facets at all,
+     * and we don't carry the post's facets), so URLs and @handles read as dead text.
+     * Turn them into real <a> nodes built through el() - no innerHTML, so this stays
+     * safe under the page's Trusted-Types CSP. Recognised:
+     *   • https:// (and http://) and www. links            -> the link itself
+     *   • @handle mentions (anything with a dot after the @) -> bsky.app/profile/handle
+     *   • bare foo.bsky.social handles (no @)                -> bsky.app/profile/foo…
+     * Bare non-bsky domains are deliberately left alone, so ordinary words with a dot
+     * aren't swept up. ----------------------------------------------------------- */
+    const LINKIFY_RE = /(?:https?:\/\/|www\.)[^\s]+|@[a-z0-9][a-z0-9.\-]*|[a-z0-9][a-z0-9\-]*(?:\.[a-z0-9\-]+)*\.bsky\.social/gi;
+
+    // Pull trailing sentence punctuation / quotes / unbalanced brackets back out of a
+    // match, so "(see https://x.com)." links just the URL - the ")." returns to text.
+    function linkTrimTail(s) {
+        const count = (str, c) => { let n = 0; for (let k = 0; k < str.length; k++) if (str[k] === c) n++; return n; };
+        let i = s.length;
+        while (i > 0) {
+            const ch = s[i - 1];
+            if ('.,;:!?\'"”’»)]}>'.indexOf(ch) === -1) break;
+            const sub = s.slice(0, i); // a closer is kept only while it stays balanced (foo_(bar))
+            if ((ch === ')' && count(sub, ')') <= count(sub, '(')) ||
+                (ch === ']' && count(sub, ']') <= count(sub, '[')) ||
+                (ch === '}' && count(sub, '}') <= count(sub, '{'))) break;
+            i--;
+        }
+        return s.slice(0, i);
+    }
+
+    function linkNode(text, href) {
+        return el('a', {
+            class: 'bgt-lb-link', href, target: '_blank', rel: 'noopener noreferrer',
+            onClick: (e) => e.stopPropagation(), // never bubble to the lightbox backdrop
+        }, text);
+    }
+
+    // Split `text` into an array of text nodes + <a> nodes. Returns [] for empty input.
+    function linkify(text) {
+        const out = [];
+        if (!text) return out;
+        let last = 0, m;
+        LINKIFY_RE.lastIndex = 0;
+        while ((m = LINKIFY_RE.exec(text))) {
+            const start = m.index;
+            const isUrl = /^(https?:\/\/|www\.)/i.test(m[0]);
+            const isMention = m[0][0] === '@';
+
+            // Mentions / bare handles must sit on a real boundary, so we don't grab the
+            // domain of an e-mail (bob@alice.bsky.social) or a mid-word run.
+            if (!isUrl) {
+                const prev = start > 0 ? text[start - 1] : '';
+                if (prev && /[a-z0-9@._\-]/i.test(prev)) { LINKIFY_RE.lastIndex = start + 1; continue; }
+            }
+
+            const matched = linkTrimTail(m[0]);
+            // A mention with nothing dotted after the @ isn't a handle (e.g. a stray "@" ).
+            if (isMention && matched.slice(1).indexOf('.') === -1) { LINKIFY_RE.lastIndex = start + 1; continue; }
+
+            let href;
+            if (isUrl) href = /^www\./i.test(matched) ? 'https://' + matched : matched;
+            else if (isMention) href = 'https://bsky.app/profile/' + matched.slice(1);
+            else href = 'https://bsky.app/profile/' + matched; // bare foo.bsky.social
+
+            if (start > last) out.push(document.createTextNode(text.slice(last, start)));
+            out.push(linkNode(matched, href));
+            last = start + matched.length;
+            LINKIFY_RE.lastIndex = last; // any trimmed tail rejoins the text stream
+        }
+        if (last < text.length) out.push(document.createTextNode(text.slice(last)));
+        return out;
+    }
+
+    // Replace a container's contents with the linkified form of `text`.
+    function setLinkified(container, text) {
+        while (container.firstChild) container.removeChild(container.firstChild);
+        linkify(text).forEach(n => container.appendChild(n));
+    }
+
     function applyPostInfo() {
         if (!lbPostText) return;
         const st = curPostState();
         const text = (settings.postInfo && st && st.text) ? st.text : '';
-        lbPostText.textContent = text;
+        setLinkified(lbPostText, text);
         lbPostText.style.display = text ? 'block' : 'none';
     }
 
@@ -1203,7 +1281,7 @@
         if (!lbCap) return;
         const it = grid.items[lbIndex];
         const alt = (settings.altText && it && it.alt) ? it.alt : '';
-        lbCap.textContent = alt;
+        setLinkified(lbCap, alt);
         lbCap.style.display = alt ? 'block' : 'none';
     }
 
@@ -1962,6 +2040,10 @@
         #${LIGHTBOX_ID} .bgt-lb-text { max-height: 22vh; font-size: 14px; color: #f1f3f5; }
         #${LIGHTBOX_ID} .bgt-lb-cap { max-height: 14vh; font-size: 13px; color: #d2d9e0; }
         #${LIGHTBOX_ID} .bgt-lb-post { color: #4aa8ff; text-decoration: none; white-space: nowrap; }
+        #${LIGHTBOX_ID} .bgt-lb-text a.bgt-lb-link, #${LIGHTBOX_ID} .bgt-lb-cap a.bgt-lb-link {
+            color: ${ACCENT}; text-decoration: none; overflow-wrap: anywhere; word-break: break-word;
+        }
+        #${LIGHTBOX_ID} .bgt-lb-text a.bgt-lb-link:hover, #${LIGHTBOX_ID} .bgt-lb-cap a.bgt-lb-link:hover { text-decoration: underline; }
         .bgt-act {
             display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 10px;
             border: none; background: transparent; color: #aeb9c4; cursor: pointer; border-radius: 999px;
