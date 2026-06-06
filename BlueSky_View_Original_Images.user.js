@@ -1,15 +1,16 @@
 // ==UserScript==
 // @name         BlueSky (View Original Images)
-// @namespace    http://tampermonkey.net/
-// @version      0.31
 // @description  Load the original images anywhere that thumbnails are loaded.
 // @author       QuentinWolf
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
+// @namespace    quentinwolf_bluesky_view_original_images
+// @version      0.32
+// @license      GPL-3.0-or-later
 // @match        https://bsky.app/*
 // @match        https://av-cdn.bsky.app/img/*
 // @match        https://cdn.bsky.app/img/*
-// @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
-// @downloadURL  https://github.com/quentinwolf/Tampermonkey-Scripts/raw/refs/heads/main/BlueSky_View_Original_Images.user.js
-// @updateURL    https://github.com/quentinwolf/Tampermonkey-Scripts/raw/refs/heads/main/BlueSky_View_Original_Images.user.js
+// @downloadURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/raw/refs/heads/main/BlueSky_View_Original_Images.user.js
+// @updateURL    https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/raw/refs/heads/main/BlueSky_View_Original_Images.user.js
 // @grant        none
 // ==/UserScript==
 

@@ -2,17 +2,18 @@
 // @name         Bluesky Gallery Toggle
 // @description  Replaces a profile's Media view with an x.com-style media grid (images + video), fed live by the AT Protocol API with infinite scroll. Full-screen or in-line.
 // @author       @quentinwolf.ca
-// @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
-// @namespace    quentinwolf
-// @version      2.8.2
+// @namespace    quentinwolf_bluesky_gallery_toggle
+// @version      2.8.3
+// @license      GPL-3.0-or-later
+// @match        *://bsky.app/*
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        unsafeWindow
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js    // for in-lightbox video playback (including .m3u8 from the API and Tenor/Giphy GIFs that come in as external embeds)
-// @downloadURL  https://github.com/quentinwolf/Tampermonkey-Scripts/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
-// @updateURL    https://github.com/quentinwolf/Tampermonkey-Scripts/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
+// @downloadURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
+// @updateURL    https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
 // ==/UserScript==
 
 (function () {
