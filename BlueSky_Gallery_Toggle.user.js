@@ -5,7 +5,7 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.8.1
+// @version      2.8.2
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -322,6 +322,21 @@
     // handle for unfollow) or null; isMe suppresses the button on your own profile.
     const profile = { actor: null, did: null, handle: null, displayName: '', followUri: null, isMe: false, _busyFollow: false };
 
+    // One Follow/Following pill, reused by the header bar and the lightbox. Starts
+    // hidden; updateFollowButton()/updateFollowVisibility() drive its state + display.
+    // Label swap (+ Follow / Following / Unfollow) is pure CSS, keyed off bgt-following.
+    function buildFollowButton() {
+        const plus = svgIcon(ICON_PLUS, 15, 15);
+        plus.classList.add('bgt-fl-plus');
+        return el('button', {
+            class: 'bgt-followbtn', type: 'button', style: { display: 'none' },
+            onClick: (e) => { e.preventDefault(); e.stopPropagation(); toggleFollow(); },
+        }, plus,
+            el('span', { class: 'bgt-fl-follow' }, 'Follow'),
+            el('span', { class: 'bgt-fl-following' }, 'Following'),
+            el('span', { class: 'bgt-fl-unfollow' }, 'Unfollow'));
+    }
+
     function buildHeader(actor) {
         const title = el('div', { class: 'bgt-title' }, actor.startsWith('did:') ? actor : '@' + actor);
         headerTitleEl = title; // loadProfile() swaps a raw did for the resolved @handle
@@ -339,15 +354,7 @@
         // session, a resolved DID, and that this isn't your own profile; in in-line
         // mode it also stays hidden until the bar pins to the top, so it never doubles
         // up with the profile's own follow button while the bio is still on screen.
-        const followPlus = svgIcon(ICON_PLUS, 15, 15);
-        followPlus.classList.add('bgt-fl-plus');
-        followBtn = el('button', {
-            class: 'bgt-followbtn', type: 'button', style: { display: 'none' },
-            onClick: (e) => { e.preventDefault(); e.stopPropagation(); toggleFollow(); },
-        }, followPlus,
-            el('span', { class: 'bgt-fl-follow' }, 'Follow'),
-            el('span', { class: 'bgt-fl-following' }, 'Following'),
-            el('span', { class: 'bgt-fl-unfollow' }, 'Unfollow'));
+        followBtn = buildFollowButton();
 
         return el('div', { class: 'bgt-header' },
             closeBtn,
@@ -772,19 +779,28 @@
         updateFollowVisibility();
     }
 
-    // Swap the raw DID shown in the title for the resolved @handle once we have it.
+    // Reflect the resolved @handle wherever we show identity: the header title (swapping
+    // out a raw DID) and the lightbox's top-corner handle link.
     function updateHeaderIdentity() {
         if (headerTitleEl && profile.handle) headerTitleEl.textContent = '@' + profile.handle;
+        if (lbHandleLink) {
+            lbHandleLink.textContent = profile.handle ? '@' + profile.handle : '';
+            lbHandleLink.href = 'https://bsky.app/profile/' + (profile.handle || profile.did || '');
+        }
     }
 
-    // Paint the follow button's state. The label swap (+ Follow / Following / Unfollow)
-    // and colours live in CSS, keyed off the bgt-following class; 'pending' counts as
-    // following so the optimistic flip sticks while the write is in flight.
+    // Paint the follow button(s). The header and lightbox buttons share one state object,
+    // so both stay in sync. The label swap (+ Follow / Following / Unfollow) and colours
+    // live in CSS keyed off the bgt-following class; 'pending' counts as following so the
+    // optimistic flip sticks while the write is in flight.
     function updateFollowButton() {
-        if (!followBtn) return;
         const following = !!profile.followUri;
-        followBtn.classList.toggle('bgt-following', following);
-        followBtn.title = (following ? 'Unfollow @' : 'Follow @') + (profile.handle || '');
+        const title = (following ? 'Unfollow @' : 'Follow @') + (profile.handle || '');
+        [followBtn, lbFollowBtn].forEach(btn => {
+            if (!btn) return;
+            btn.classList.toggle('bgt-following', following);
+            btn.title = title;
+        });
     }
 
     // True once the sticky bar has risen near the top of the viewport - i.e. it's pinned
@@ -801,14 +817,17 @@
     }
 
     function updateFollowVisibility() {
-        if (!followBtn) return;
         // Only meaningful with a writable session, a known DID, and not your own profile.
         const eligible = !!getMyDid() && !!profile.did && !profile.isMe;
-        // Full screen hides the bio entirely, so the button is always welcome there;
-        // in-line shows it only once the bar nears the top (else it would duplicate the
-        // bio's own follow button while the bio is still on screen).
-        const show = eligible && (mountedMode !== 'inline' || headerNearTop());
-        followBtn.style.display = show ? '' : 'none';
+        if (followBtn) {
+            // Full screen hides the bio entirely, so the button is always welcome there;
+            // in-line shows it only once the bar nears the top (else it would duplicate
+            // the bio's own follow button while the bio is still on screen).
+            const show = eligible && (mountedMode !== 'inline' || headerNearTop());
+            followBtn.style.display = show ? '' : 'none';
+        }
+        // The lightbox covers the page, so its follow button just tracks eligibility.
+        if (lbFollowBtn) lbFollowBtn.style.display = eligible ? '' : 'none';
     }
 
     // Scroll fires often; collapse a burst into one rAF-aligned visibility check.
@@ -853,6 +872,7 @@
      * ==================================================================== */
     let lbEl, lbImg, lbVideo, lbHls, lbCap, lbLink, lbPrev, lbNext, lbIndex = 0, lbKeyHandler;
     let lbActionsRow, lbReply, lbRepost, lbLike, lbBookmark, lbPostText, lbTime, lbThumbs;
+    let lbFollowBtn = null, lbHandleLink = null; // top-corner identity + follow (shares profile state)
     let lbLoading, lbLoadingSpin, lbLoadingText; // "Loading media…" overlay while an image decodes
     let thumbsRange = null; // [lo,hi] of items currently rendered in the thumbnail strip
     let lbLastDir = 1;            // last lightbox nav direction (+1 next / -1 prev), to bias prefetch
@@ -948,6 +968,12 @@
         lbPrev = el('button', { class: 'bgt-iconbtn bgt-lb-nav bgt-lb-prev', title: 'Previous', onClick: (e) => { e.stopPropagation(); navLightbox(-1); } }, '‹');
         lbNext = el('button', { class: 'bgt-iconbtn bgt-lb-nav bgt-lb-next', title: 'Next', onClick: (e) => { e.stopPropagation(); navLightbox(1); } }, '›');
         const close = el('button', { class: 'bgt-iconbtn bgt-lb-close', title: 'Close (Esc)', onClick: closeLightbox }, '✕');
+        // Top-corner identity + follow, held well left of the close button (~150px) so a
+        // mis-aimed close never lands on Follow. The button shares the header's profile
+        // state, so following here updates both at once.
+        lbHandleLink = el('a', { class: 'bgt-lb-handle', target: '_blank', rel: 'noopener', onClick: (e) => e.stopPropagation() });
+        lbFollowBtn = buildFollowButton();
+        const lbTop = el('div', { class: 'bgt-lb-top' }, lbHandleLink, lbFollowBtn);
         // Top strip of sibling-image thumbnails; only populated for multi-image posts.
         lbThumbs = el('div', { class: 'bgt-lb-thumbs' });
         thumbsRange = null; // fresh element, so force a rebuild on the first show
@@ -959,8 +985,12 @@
         lbLoading = el('div', { class: 'bgt-lb-loading' }, lbLoadingSpin, lbLoadingText);
 
         lbEl = el('div', { id: LIGHTBOX_ID, onClick: (e) => { if (e.target === lbEl) closeLightbox(); } },
-            close, lbThumbs, lbPrev, el('div', { class: 'bgt-lb-stage' }, lbImg, lbVideo, lbLoading), lbNext, bar);
+            close, lbTop, lbThumbs, lbPrev, el('div', { class: 'bgt-lb-stage' }, lbImg, lbVideo, lbLoading), lbNext, bar);
         document.body.appendChild(lbEl);
+        // Seed the freshly built top-corner controls from the current profile state.
+        updateHeaderIdentity();
+        updateFollowButton();
+        updateFollowVisibility();
 
         // Mouse-wheel (navigate / flip thumbnails / zoom) + cursor-follow pan. Both are
         // gated on the settings at event time, so they're inert until enabled. passive:
@@ -1476,7 +1506,7 @@
         if (inlineScrollHandler) { window.removeEventListener('scroll', inlineScrollHandler, true); inlineScrollHandler = null; }
         pendingHeader = null;
         closeLightbox();
-        if (lbEl) { lbEl.remove(); lbEl = null; }
+        if (lbEl) { lbEl.remove(); lbEl = null; lbFollowBtn = lbHandleLink = null; }
         if (io) { io.disconnect(); io = null; }
         if (overlayKeyHandler) { document.removeEventListener('keydown', overlayKeyHandler); overlayKeyHandler = null; }
         if (rootEl) { rootEl.remove(); rootEl = null; }
@@ -1777,28 +1807,28 @@
         }
         .bgt-iconbtn:hover { background: rgba(127,127,127,0.18); }
 
-        /* ---- header follow / following button ---- */
-        #${OVERLAY_ID} .bgt-followbtn {
+        /* ---- follow / following button (header bar + lightbox) ---- */
+        .bgt-followbtn {
             display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 16px;
             border: none; border-radius: 999px; cursor: pointer; white-space: nowrap;
             font-size: 14px; font-weight: 600; line-height: 1;
             font-family: InterVariable, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, sans-serif;
             background: ${ACCENT}; color: #fff; transition: background-color 120ms ease, color 120ms ease;
         }
-        #${OVERLAY_ID} .bgt-followbtn:hover { background: #2f93f0; }
-        #${OVERLAY_ID} .bgt-followbtn svg { display: block; }
+        .bgt-followbtn:hover { background: #2f93f0; }
+        .bgt-followbtn svg { display: block; }
         /* Following: neutral grey pill (inherits the theme's text colour so it reads on
            light AND dark); hovering it reveals the red "Unfollow" cue. */
-        #${OVERLAY_ID} .bgt-followbtn.bgt-following { background: rgba(127,127,127,0.22); color: inherit; }
-        #${OVERLAY_ID} .bgt-followbtn.bgt-following:hover { background: rgba(244,33,46,0.14); color: #f4212e; }
+        .bgt-followbtn.bgt-following { background: rgba(127,127,127,0.22); color: inherit; }
+        .bgt-followbtn.bgt-following:hover { background: rgba(244,33,46,0.14); color: #f4212e; }
         /* Label/icon visibility is state-driven: "+ Follow" / "Following" / (hover) "Unfollow". */
-        #${OVERLAY_ID} .bgt-followbtn .bgt-fl-following,
-        #${OVERLAY_ID} .bgt-followbtn .bgt-fl-unfollow { display: none; }
-        #${OVERLAY_ID} .bgt-followbtn.bgt-following .bgt-fl-plus,
-        #${OVERLAY_ID} .bgt-followbtn.bgt-following .bgt-fl-follow { display: none; }
-        #${OVERLAY_ID} .bgt-followbtn.bgt-following .bgt-fl-following { display: inline; }
-        #${OVERLAY_ID} .bgt-followbtn.bgt-following:hover .bgt-fl-following { display: none; }
-        #${OVERLAY_ID} .bgt-followbtn.bgt-following:hover .bgt-fl-unfollow { display: inline; }
+        .bgt-followbtn .bgt-fl-following,
+        .bgt-followbtn .bgt-fl-unfollow { display: none; }
+        .bgt-followbtn.bgt-following .bgt-fl-plus,
+        .bgt-followbtn.bgt-following .bgt-fl-follow { display: none; }
+        .bgt-followbtn.bgt-following .bgt-fl-following { display: inline; }
+        .bgt-followbtn.bgt-following:hover .bgt-fl-following { display: none; }
+        .bgt-followbtn.bgt-following:hover .bgt-fl-unfollow { display: inline; }
 
         #${OVERLAY_ID} .bgt-scroll { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; }
         #${OVERLAY_ID} .bgt-inner { max-width: 1200px; margin: 0 auto; padding: 8px; }
@@ -1866,6 +1896,22 @@
             aspect-ratio: var(--bgt-ar, 16 / 9);
         }
         #${LIGHTBOX_ID} .bgt-lb-close { position: absolute; top: 16px; right: 20px; z-index: 4; }
+        /* Identity + follow cluster, top-right but held ~150px clear of the close button. */
+        #${LIGHTBOX_ID} .bgt-lb-top {
+            position: absolute; top: 16px; right: 150px; z-index: 4;
+            display: flex; align-items: center; gap: 12px;
+        }
+        #${LIGHTBOX_ID} .bgt-lb-handle {
+            color: #f1f3f5; font-size: 15px; font-weight: 600; text-decoration: none;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 36vw;
+            text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+        }
+        #${LIGHTBOX_ID} .bgt-lb-handle:hover { text-decoration: underline; }
+        #${LIGHTBOX_ID} .bgt-lb-handle:empty { display: none; }
+        /* The lightbox is always dark, so the grey "Following" pill needs light text
+           regardless of the page theme (overriding the global color:inherit). */
+        #${LIGHTBOX_ID} .bgt-followbtn.bgt-following { color: #f1f3f5; }
+        #${LIGHTBOX_ID} .bgt-followbtn.bgt-following:hover { color: #f4212e; }
         #${LIGHTBOX_ID} .bgt-lb-nav {
             position: absolute; top: 50%; transform: translateY(-50%);
             width: 50px; height: 50px; font-size: 34px; background: rgba(0,0,0,0.4);
