@@ -5,11 +5,12 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.5.5
+// @version      2.6.1
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        unsafeWindow
+// @require      https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js
 // @downloadURL  https://github.com/quentinwolf/Tampermonkey-Scripts/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
 // @updateURL    https://github.com/quentinwolf/Tampermonkey-Scripts/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
 // ==/UserScript==
@@ -227,12 +228,18 @@
                 });
             });
         } else if (type === 'app.bsky.embed.video#view') {
+            // playlist is the HLS .m3u8 the lightbox plays via hls.js; aspectRatio
+            // lets us size the <video> before metadata loads. Both ride in the feed
+            // payload we already fetched - no extra API call.
             tiles.push({
                 kind: 'video',
                 label: 'Video',
                 thumb: embed.thumbnail,
+                playlist: embed.playlist || '',
+                aspectRatio: embed.aspectRatio || null,
                 alt: embed.alt || '',
                 url: postUrl(post),
+                postState: postStateFrom(post),
             });
         } else if (type === 'app.bsky.embed.external#view' && embed.external && embed.external.thumb) {
             // Tenor/Giphy gifs ride in as external embeds; include them as playable tiles.
@@ -292,7 +299,7 @@
      * ==================================================================== */
     const grid = {
         actor: null, videosOnly: false, cursor: undefined, loading: false, done: false,
-        images: [], seen: null,
+        items: [], seen: null, // lightbox-viewable items (images + native videos), in grid order
     };
     let rootEl, scrollEl, gridEl, sentinelEl, countEl, io, overlayKeyHandler;
     let mountedMode = null, inlineHost = null, inlineResizeHandler = null;
@@ -456,8 +463,9 @@
                 // Leave modified / non-primary clicks to the browser (new tab, etc).
                 if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
                 e.preventDefault();
-                if (t.kind === 'image') openLightbox(t._imgIndex);
-                else unsafeWindow.open(t.url, '_blank', 'noopener'); // video/gif -> the post
+                // Images and native videos have a lightbox slot; GIF/external open the post.
+                if (t._lbIndex != null) openLightbox(t._lbIndex);
+                else unsafeWindow.open(t.url, '_blank', 'noopener');
             },
         }, img);
 
@@ -474,9 +482,14 @@
             const key = t.thumb || (t.url + t.alt);
             if (grid.seen.has(key)) return;
             grid.seen.add(key);
-            if (t.kind === 'image') {
-                t._imgIndex = grid.images.length;
-                grid.images.push({ full: t.full, alt: t.alt, url: t.url, postState: t.postState });
+            // Images and native videos (those with an HLS playlist) are viewable in the
+            // lightbox; GIF/external embeds have no playlist, so they stay click-to-post.
+            if (t.kind === 'image' || (t.kind === 'video' && t.playlist)) {
+                t._lbIndex = grid.items.length;
+                grid.items.push({
+                    kind: t.kind, full: t.full, thumb: t.thumb, alt: t.alt, url: t.url,
+                    playlist: t.playlist, aspectRatio: t.aspectRatio, postState: t.postState,
+                });
             }
             frag.appendChild(makeTile(t));
         });
@@ -681,7 +694,7 @@
     /* ======================================================================
      * 5. Lightbox for images (videos/gifs open the post instead).
      * ==================================================================== */
-    let lbEl, lbImg, lbCap, lbLink, lbPrev, lbNext, lbIndex = 0, lbKeyHandler;
+    let lbEl, lbImg, lbVideo, lbHls, lbCap, lbLink, lbPrev, lbNext, lbIndex = 0, lbKeyHandler;
     let lbActionsRow, lbReply, lbRepost, lbLike, lbBookmark, lbPostText, lbTime;
 
     // Build one action button. `withCount` adds a live counter; like/bookmark pass a
@@ -700,7 +713,7 @@
     }
 
     function curPostState() {
-        const im = grid.images[lbIndex];
+        const im = grid.items[lbIndex];
         return im && im.postState;
     }
 
@@ -738,6 +751,18 @@
 
     function buildLightbox() {
         lbImg = el('img', { class: 'bgt-lbimg', alt: '' });
+        // Native <video> + controls; hls.js feeds it the .m3u8 (see attachVideo). loop
+        // matches Bluesky (lots of "videos" are really gifs, so a single play-through
+        // breaks the immersion).
+        lbVideo = el('video', { class: 'bgt-lbvideo', controls: true, loop: true, preload: 'none', style: { display: 'none' } });
+        lbVideo.setAttribute('playsinline', '');
+        // Once the real dimensions are known, drive the box's aspect-ratio off them so
+        // the player fills the stage at the right shape no matter which rendition the
+        // ABR ladder started on.
+        lbVideo.addEventListener('loadedmetadata', () => {
+            if (lbVideo.videoWidth && lbVideo.videoHeight)
+                lbVideo.style.setProperty('--bgt-ar', lbVideo.videoWidth + ' / ' + lbVideo.videoHeight);
+        });
         lbCap = el('div', { class: 'bgt-lb-cap' });
         lbPostText = el('div', { class: 'bgt-lb-text' });
         lbLink = el('a', { class: 'bgt-lb-post', target: '_blank', rel: 'noopener' }, 'Open post ↗');
@@ -764,7 +789,7 @@
         const close = el('button', { class: 'bgt-iconbtn bgt-lb-close', title: 'Close (Esc)', onClick: closeLightbox }, '✕');
 
         lbEl = el('div', { id: LIGHTBOX_ID, onClick: (e) => { if (e.target === lbEl) closeLightbox(); } },
-            close, lbPrev, el('div', { class: 'bgt-lb-stage' }, lbImg), lbNext, bar);
+            close, lbPrev, el('div', { class: 'bgt-lb-stage' }, lbImg, lbVideo), lbNext, bar);
         document.body.appendChild(lbEl);
 
         // stopImmediatePropagation + window-capture so we win over Bluesky's own
@@ -777,16 +802,94 @@
     }
 
     function showLightbox() {
-        const it = grid.images[lbIndex];
+        const it = grid.items[lbIndex];
         if (!it) return;
-        lbImg.src = it.full;
-        lbImg.alt = it.alt || '';
+        teardownVideo(); // stop/detach whatever was playing before we switch slots
+        const isVideo = it.kind === 'video';
+        lbEl.classList.toggle('bgt-has-video', isVideo);
+        if (isVideo) {
+            lbImg.style.display = 'none';
+            lbImg.removeAttribute('src');
+            lbVideo.style.display = 'block';
+            lbVideo.poster = it.thumb || '';
+            // Seed the box shape from the embed's aspectRatio so the poster sizes right
+            // before metadata; the loadedmetadata handler then refines it from the real
+            // video. (Default 16/9 via CSS until either is known.)
+            if (it.aspectRatio && it.aspectRatio.width && it.aspectRatio.height)
+                lbVideo.style.setProperty('--bgt-ar', it.aspectRatio.width + ' / ' + it.aspectRatio.height);
+            else lbVideo.style.removeProperty('--bgt-ar');
+            attachVideo(it);
+        } else {
+            lbVideo.style.display = 'none';
+            lbImg.style.display = 'block';
+            lbImg.src = it.full;
+            lbImg.alt = it.alt || '';
+        }
         lbLink.href = it.url;
         lbPrev.style.visibility = lbIndex > 0 ? 'visible' : 'hidden';
-        lbNext.style.visibility = lbIndex < grid.images.length - 1 ? 'visible' : 'hidden';
+        lbNext.style.visibility = lbIndex < grid.items.length - 1 ? 'visible' : 'hidden';
         updateActionBar();
         applyPostInfo();
         applyAltText();
+    }
+
+    // hls.js arrives via @require; grab it wherever the userscript manager parked it.
+    function getHls() {
+        return (typeof Hls !== 'undefined' && Hls) || window.Hls || unsafeWindow.Hls || null;
+    }
+
+    // Tear down any active playback: destroy the hls.js instance and reset the element
+    // so a stale stream never bleeds into the next item (or keeps decoding in the bg).
+    function teardownVideo() {
+        if (lbHls) { try { lbHls.destroy(); } catch (_) { /* ignore */ } lbHls = null; }
+        if (lbVideo) {
+            try { lbVideo.pause(); } catch (_) { /* ignore */ }
+            lbVideo.removeAttribute('src');
+            try { lbVideo.load(); } catch (_) { /* ignore */ }
+        }
+    }
+
+    // Point the <video> at the post's HLS playlist. Safari plays .m3u8 natively;
+    // everything else goes through hls.js. Autoplay is attempted (the click/keypress
+    // that opened the item is a user gesture) and falls back to the visible controls.
+    function attachVideo(it) {
+        const url = it && it.playlist;
+        if (!lbVideo || !url) return;
+        const v = lbVideo;
+        const tryPlay = () => { const p = v.play(); if (p && p.catch) p.catch(() => logDebug('video: autoplay blocked, awaiting user')); };
+
+        if (v.canPlayType('application/vnd.apple.mpegurl')) {
+            v.src = url;
+            v.addEventListener('loadedmetadata', tryPlay, { once: true });
+            logDebug('video: native HLS', url);
+            return;
+        }
+
+        const HlsLib = getHls();
+        if (HlsLib && HlsLib.isSupported()) {
+            // abrEwmaDefaultEstimate biases the *first* rendition pick toward HD: the
+            // ABR controller assumes ~5 Mbps until it has measured real bandwidth, so
+            // playback starts at full resolution instead of climbing the ladder from
+            // 240p (which short/looping clips often end before reaching).
+            const hls = new HlsLib({ enableWorker: true, abrEwmaDefaultEstimate: 5000000 });
+            lbHls = hls;
+            hls.on(HlsLib.Events.MANIFEST_PARSED, () => { logDebug('video: manifest parsed'); tryPlay(); });
+            hls.on(HlsLib.Events.ERROR, (_evt, data) => {
+                logDebug('video: hls error type=' + (data && data.type) + ' details=' + (data && data.details) + ' fatal=' + (data && data.fatal));
+                if (!data || !data.fatal) return;
+                if (data.type === HlsLib.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+                else if (data.type === HlsLib.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+                else teardownVideo();
+            });
+            hls.loadSource(url);
+            hls.attachMedia(v);
+            logDebug('video: hls.js attached', url);
+            return;
+        }
+
+        // No HLS path in this browser: let the user watch it natively on the post.
+        logDebug('video: no HLS support; opening post');
+        unsafeWindow.open(it.url, '_blank', 'noopener');
     }
 
     function applyPostInfo() {
@@ -799,7 +902,7 @@
 
     function applyAltText() {
         if (!lbCap) return;
-        const it = grid.images[lbIndex];
+        const it = grid.items[lbIndex];
         const alt = (settings.altText && it && it.alt) ? it.alt : '';
         lbCap.textContent = alt;
         lbCap.style.display = alt ? 'block' : 'none';
@@ -815,14 +918,15 @@
 
     function navLightbox(d) {
         const n = lbIndex + d;
-        if (n < 0 || n >= grid.images.length) return;
+        if (n < 0 || n >= grid.items.length) return;
         lbIndex = n;
         showLightbox();
-        if (n >= grid.images.length - 4) maybeLoadMore(); // keep nav going near the end
+        if (n >= grid.items.length - 4) maybeLoadMore(); // keep nav going near the end
     }
 
     function closeLightbox() {
         if (!lbEl) return;
+        teardownVideo();
         lbEl.style.display = 'none';
         lbImg.src = '';
         unsafeWindow.removeEventListener('keydown', lbKeyHandler, true);
@@ -885,7 +989,7 @@
         grid.cursor = undefined;
         grid.done = false;
         grid.loading = false;
-        grid.images = [];
+        grid.items = [];
         grid.seen = new Set();
 
         gridEl = el('div', { class: 'bgt-grid' });
@@ -1227,6 +1331,15 @@
         }
         #${LIGHTBOX_ID} .bgt-lb-stage { display: flex; align-items: center; justify-content: center; }
         #${LIGHTBOX_ID} .bgt-lbimg { max-width: 94vw; max-height: 90vh; object-fit: contain; border-radius: 4px; }
+        #${LIGHTBOX_ID} .bgt-lbvideo { max-width: 94vw; max-height: 90vh; object-fit: contain; border-radius: 4px; background: #000; }
+        /* A definite box, sized by the video's aspect ratio, so the player fills the
+           stage and upscales a low starting rendition (object-fit) instead of shrinking
+           to the rendition's own pixels. Height is capped so the native controls clear
+           the action bar pinned along the bottom of the lightbox. */
+        #${LIGHTBOX_ID}.bgt-has-video .bgt-lbvideo {
+            height: 74vh; width: auto; max-width: 94vw; max-height: 74vh;
+            aspect-ratio: var(--bgt-ar, 16 / 9);
+        }
         #${LIGHTBOX_ID} .bgt-lb-close { position: absolute; top: 16px; right: 20px; }
         #${LIGHTBOX_ID} .bgt-lb-nav {
             position: absolute; top: 50%; transform: translateY(-50%);
