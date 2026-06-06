@@ -5,7 +5,7 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.6.3
+// @version      2.7.0
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -31,6 +31,7 @@
     const DEBUG_KEY = 'bsky-gallery-debug';          // boolean: console logging
     const POSTINFO_KEY = 'bsky-gallery-postinfo';    // boolean: post text in lightbox
     const ALT_KEY = 'bsky-gallery-alt';              // boolean: image alt text in lightbox
+    const CONTINUOUS_KEY = 'bsky-gallery-continuous';// boolean: lightbox arrows cross posts
     const BITRATE_KEY = 'bsky-gallery-bitrate';      // number: video start-quality guess, Mbps (1-25)
     const PAGE_LIMIT = 100;                          // max getAuthorFeed page size
     const PUBLIC_API = 'https://public.api.bsky.app'; // unauthenticated fallback
@@ -66,6 +67,7 @@
         debug: GM_getValue(DEBUG_KEY, false),
         postInfo: GM_getValue(POSTINFO_KEY, false),
         altText: GM_getValue(ALT_KEY, false),
+        continuousNav: GM_getValue(CONTINUOUS_KEY, true),
         bitrate: GM_getValue(BITRATE_KEY, 5),
     };
 
@@ -697,7 +699,8 @@
      * 5. Lightbox for images (videos/gifs open the post instead).
      * ==================================================================== */
     let lbEl, lbImg, lbVideo, lbHls, lbCap, lbLink, lbPrev, lbNext, lbIndex = 0, lbKeyHandler;
-    let lbActionsRow, lbReply, lbRepost, lbLike, lbBookmark, lbPostText, lbTime;
+    let lbActionsRow, lbReply, lbRepost, lbLike, lbBookmark, lbPostText, lbTime, lbThumbs;
+    let thumbsRange = null; // [lo,hi] of items currently rendered in the thumbnail strip
 
     // Build one action button. `withCount` adds a live counter; like/bookmark pass a
     // second path so the icon can swap to its filled variant when active.
@@ -789,9 +792,12 @@
         lbPrev = el('button', { class: 'bgt-iconbtn bgt-lb-nav bgt-lb-prev', title: 'Previous', onClick: (e) => { e.stopPropagation(); navLightbox(-1); } }, '‹');
         lbNext = el('button', { class: 'bgt-iconbtn bgt-lb-nav bgt-lb-next', title: 'Next', onClick: (e) => { e.stopPropagation(); navLightbox(1); } }, '›');
         const close = el('button', { class: 'bgt-iconbtn bgt-lb-close', title: 'Close (Esc)', onClick: closeLightbox }, '✕');
+        // Top strip of sibling-image thumbnails; only populated for multi-image posts.
+        lbThumbs = el('div', { class: 'bgt-lb-thumbs' });
+        thumbsRange = null; // fresh element, so force a rebuild on the first show
 
         lbEl = el('div', { id: LIGHTBOX_ID, onClick: (e) => { if (e.target === lbEl) closeLightbox(); } },
-            close, lbPrev, el('div', { class: 'bgt-lb-stage' }, lbImg, lbVideo), lbNext, bar);
+            close, lbThumbs, lbPrev, el('div', { class: 'bgt-lb-stage' }, lbImg, lbVideo), lbNext, bar);
         document.body.appendChild(lbEl);
 
         // stopImmediatePropagation + window-capture so we win over Bluesky's own
@@ -828,11 +834,67 @@
             lbImg.alt = it.alt || '';
         }
         lbLink.href = it.url;
-        lbPrev.style.visibility = lbIndex > 0 ? 'visible' : 'hidden';
-        lbNext.style.visibility = lbIndex < grid.items.length - 1 ? 'visible' : 'hidden';
+        updateNavButtons();
         updateActionBar();
         applyPostInfo();
         applyAltText();
+        applyThumbs();
+    }
+
+    // Items from one post share a postState object reference (set once per post in
+    // tilesFromPost) and are contiguous in grid.items, so the current post's images are
+    // the run around lbIndex that share it. Videos have their own postState -> group of 1.
+    function postGroupRange(i) {
+        const items = grid.items;
+        const ps = items[i] && items[i].postState;
+        let lo = i, hi = i;
+        if (!ps) return [lo, hi];
+        while (lo > 0 && items[lo - 1].postState === ps) lo--;
+        while (hi < items.length - 1 && items[hi + 1].postState === ps) hi++;
+        return [lo, hi];
+    }
+
+    // Arrow-key / chevron reach: the whole gallery when continuous nav is on, otherwise
+    // just the current post's image group.
+    function navBounds() {
+        return settings.continuousNav ? [0, grid.items.length - 1] : postGroupRange(lbIndex);
+    }
+
+    function updateNavButtons() {
+        const [lo, hi] = navBounds();
+        lbPrev.style.visibility = lbIndex > lo ? 'visible' : 'hidden';
+        lbNext.style.visibility = lbIndex < hi ? 'visible' : 'hidden';
+    }
+
+    // The thumbnail strip shows the current post's sibling images (2-4); for single
+    // images and videos it stays hidden. Rebuilt only when the post group changes, so
+    // arrowing within a post just moves the highlight (no thumbnail reflow/reload).
+    function applyThumbs() {
+        if (!lbThumbs) return;
+        const [lo, hi] = postGroupRange(lbIndex);
+        if (hi - lo < 1) { // single item: no strip
+            while (lbThumbs.firstChild) lbThumbs.removeChild(lbThumbs.firstChild);
+            lbThumbs.style.display = 'none';
+            lbEl.classList.remove('bgt-has-thumbs');
+            thumbsRange = null;
+            return;
+        }
+        if (!thumbsRange || thumbsRange[0] !== lo || thumbsRange[1] !== hi) {
+            while (lbThumbs.firstChild) lbThumbs.removeChild(lbThumbs.firstChild);
+            for (let i = lo; i <= hi; i++) {
+                const it = grid.items[i], idx = i;
+                lbThumbs.appendChild(el('button', {
+                    class: 'bgt-lb-thumb', type: 'button', 'data-idx': String(idx),
+                    title: it.alt || ('Image ' + (idx - lo + 1)),
+                    onClick: (e) => { e.stopPropagation(); if (idx !== lbIndex) { lbIndex = idx; showLightbox(); } },
+                }, el('img', { src: it.thumb, alt: '', draggable: false })));
+            }
+            thumbsRange = [lo, hi];
+        }
+        for (const b of lbThumbs.children)
+            b.classList.toggle('bgt-on', Number(b.getAttribute('data-idx')) === lbIndex);
+        lbThumbs.style.display = 'flex';
+        lbEl.classList.add('bgt-has-thumbs');
     }
 
     // hls.js arrives via @require; grab it wherever the userscript manager parked it.
@@ -922,11 +984,12 @@
     }
 
     function navLightbox(d) {
+        const [lo, hi] = navBounds();
         const n = lbIndex + d;
-        if (n < 0 || n >= grid.items.length) return;
+        if (n < lo || n > hi) return; // off the end of the gallery, or of the post group
         lbIndex = n;
         showLightbox();
-        if (n >= grid.items.length - 4) maybeLoadMore(); // keep nav going near the end
+        if (settings.continuousNav && n >= grid.items.length - 4) maybeLoadMore(); // keep nav going near the end
     }
 
     function closeLightbox() {
@@ -1156,6 +1219,12 @@
         applyAltText(); // live-update if the lightbox is open
     }
 
+    function setContinuousNav(on) {
+        settings.continuousNav = !!on;
+        GM_setValue(CONTINUOUS_KEY, settings.continuousNav);
+        if (lbEl && lbEl.style.display !== 'none') updateNavButtons(); // live: refresh the arrows
+    }
+
     // Clamp to a sane 1-25 Mbps integer and persist; returns the clamped value so the
     // input can snap to it. Takes effect on the next video opened (hls reads the
     // estimate when its instance is built).
@@ -1192,6 +1261,10 @@
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.altText, onChange: (e) => setAltText(e.target.checked) }),
                 el('span', {}, 'Show image alt text (accessibility)')),
+            el('label', { class: 'bgt-check-row' },
+                el('input', { type: 'checkbox', checked: settings.continuousNav, onChange: (e) => setContinuousNav(e.target.checked) }),
+                el('span', {}, 'Continuous navigation across posts')),
+            el('div', { class: 'bgt-settings-hint' }, 'On: arrows flow through every image. Off: arrows stay within a post’s images — use the thumbnail strip (shown for 2–4 image posts) to jump between them.'),
             el('div', { class: 'bgt-settings-label' }, 'Video start quality'),
             el('div', { class: 'bgt-bitrate-row' },
                 bitrateInput,
@@ -1367,13 +1440,29 @@
             height: 74vh; width: auto; max-width: 94vw; max-height: 74vh;
             aspect-ratio: var(--bgt-ar, 16 / 9);
         }
-        #${LIGHTBOX_ID} .bgt-lb-close { position: absolute; top: 16px; right: 20px; }
+        #${LIGHTBOX_ID} .bgt-lb-close { position: absolute; top: 16px; right: 20px; z-index: 4; }
         #${LIGHTBOX_ID} .bgt-lb-nav {
             position: absolute; top: 50%; transform: translateY(-50%);
             width: 50px; height: 50px; font-size: 34px; background: rgba(0,0,0,0.4);
         }
         #${LIGHTBOX_ID} .bgt-lb-prev { left: 14px; }
         #${LIGHTBOX_ID} .bgt-lb-next { right: 14px; }
+        /* ---- thumbnail strip (multi-image posts) ---- */
+        #${LIGHTBOX_ID} .bgt-lb-thumbs {
+            position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+            display: none; gap: 8px; align-items: center; padding: 6px; max-width: 92vw;
+            overflow-x: auto; background: rgba(0,0,0,0.5); border-radius: 12px; z-index: 3;
+        }
+        #${LIGHTBOX_ID} .bgt-lb-thumb {
+            flex: 0 0 auto; width: 100px; height: 100px; padding: 0; cursor: pointer;
+            border: 2px solid transparent; border-radius: 8px; overflow: hidden;
+            background: #11171f; opacity: 0.55; transition: opacity .12s ease, border-color .12s ease;
+        }
+        #${LIGHTBOX_ID} .bgt-lb-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+        #${LIGHTBOX_ID} .bgt-lb-thumb:hover { opacity: 0.85; }
+        #${LIGHTBOX_ID} .bgt-lb-thumb.bgt-on { opacity: 1; border-color: ${ACCENT}; }
+        /* Keep the image clear of the strip (and the bottom bar) while it's showing. */
+        #${LIGHTBOX_ID}.bgt-has-thumbs .bgt-lbimg { max-height: calc(100vh - 280px); }
         #${LIGHTBOX_ID} .bgt-lb-bar {
             position: absolute; left: 0; right: 0; bottom: 0; padding: 20px 18px 14px;
             display: flex; flex-direction: column; gap: 10px; color: #e6e9ec; font-size: 14px;
