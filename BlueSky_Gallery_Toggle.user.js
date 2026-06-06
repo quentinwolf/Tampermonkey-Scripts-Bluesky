@@ -5,7 +5,7 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.7.6
+// @version      2.7.7
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -1017,31 +1017,38 @@
     }
 
     /* ---- mouse-wheel: navigate / flip thumbnails / zoom (all opt-in) ---- */
-    let lbZoom = 1, wheelLastEvent = 0, wheelLastStep = 0, wheelDir = 0;
+    let lbZoom = 1, lbImgBox = null, wheelLastEvent = 0, wheelLastStep = 0, wheelDir = 0;
 
     function resetZoom() {
         if (!lbImg) return;
         lbZoom = 1;
+        lbImgBox = null;
         lbImg.style.transform = '';
         lbImg.style.transformOrigin = '';
         lbImg.style.cursor = '';
     }
 
-    // Point the scale transform at the cursor (as a % of the image box), clamped so
-    // panning never runs past the edges.
+    // Cursor position as a % of the image's UNSCALED layout box, snapshotted in lbImgBox
+    // at zoom-in. Reading getBoundingClientRect() live here would return the *scaled*
+    // rect, which shifts with the very origin we're about to set - a feedback loop that
+    // made small pans lag, overshoot, then catch up on the next move.
     function setZoomOrigin(e) {
-        const r = lbImg.getBoundingClientRect();
-        if (!r.width || !r.height) return;
+        const r = lbImgBox;
+        if (!r || !r.width || !r.height) return;
         const x = Math.min(100, Math.max(0, ((e.clientX - r.left) / r.width) * 100));
         const y = Math.min(100, Math.max(0, ((e.clientY - r.top) / r.height) * 100));
         lbImg.style.transformOrigin = x + '% ' + y + '%';
     }
 
     function zoomByWheel(e, dir) {
-        setZoomOrigin(e); // zoom toward the cursor
+        const prev = lbZoom;
         lbZoom = Math.max(1, Math.min(5, lbZoom + (dir < 0 ? 0.5 : -0.5))); // wheel up = in
-        lbImg.style.transform = lbZoom > 1 ? 'scale(' + lbZoom + ')' : '';
-        lbImg.style.cursor = lbZoom > 1 ? 'zoom-out' : 'zoom-in';
+        if (lbZoom === prev) return;                              // already at min/max
+        if (prev === 1) lbImgBox = lbImg.getBoundingClientRect(); // snapshot while still unscaled
+        if (lbZoom === 1) { resetZoom(); lbImg.style.cursor = 'zoom-in'; return; }
+        setZoomOrigin(e); // anchor the zoom at the cursor
+        lbImg.style.transform = 'scale(' + lbZoom + ')';
+        lbImg.style.cursor = 'zoom-out';
     }
 
     // While zoomed, follow the cursor so the user can pan without dragging.
