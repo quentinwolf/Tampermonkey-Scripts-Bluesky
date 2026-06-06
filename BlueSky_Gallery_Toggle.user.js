@@ -5,7 +5,7 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.6.1
+// @version      2.6.2
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -31,6 +31,7 @@
     const DEBUG_KEY = 'bsky-gallery-debug';          // boolean: console logging
     const POSTINFO_KEY = 'bsky-gallery-postinfo';    // boolean: post text in lightbox
     const ALT_KEY = 'bsky-gallery-alt';              // boolean: image alt text in lightbox
+    const BITRATE_KEY = 'bsky-gallery-bitrate';      // number: video start-quality guess, Mbps (1-25)
     const PAGE_LIMIT = 100;                          // max getAuthorFeed page size
     const PUBLIC_API = 'https://public.api.bsky.app'; // unauthenticated fallback
     const ACCENT = '#4aa8ff';
@@ -65,6 +66,7 @@
         debug: GM_getValue(DEBUG_KEY, false),
         postInfo: GM_getValue(POSTINFO_KEY, false),
         altText: GM_getValue(ALT_KEY, false),
+        bitrate: GM_getValue(BITRATE_KEY, 5),
     };
 
     // Gated console logging - toggle via the settings modal (Debug logging).
@@ -868,10 +870,13 @@
         const HlsLib = getHls();
         if (HlsLib && HlsLib.isSupported()) {
             // abrEwmaDefaultEstimate biases the *first* rendition pick toward HD: the
-            // ABR controller assumes ~5 Mbps until it has measured real bandwidth, so
-            // playback starts at full resolution instead of climbing the ladder from
-            // 240p (which short/looping clips often end before reaching).
-            const hls = new HlsLib({ enableWorker: true, abrEwmaDefaultEstimate: 5000000 });
+            // ABR controller assumes this much bandwidth until it has measured the real
+            // throughput, so playback starts at full resolution instead of climbing the
+            // ladder from 240p (which short/looping clips often end before reaching).
+            // Tunable via the settings panel (Mbps); 5 by default.
+            const startEstimate = (settings.bitrate || 5) * 1e6;
+            const hls = new HlsLib({ enableWorker: true, abrEwmaDefaultEstimate: startEstimate });
+            logDebug('video: hls start estimate', settings.bitrate + ' Mbps');
             lbHls = hls;
             hls.on(HlsLib.Events.MANIFEST_PARSED, () => { logDebug('video: manifest parsed'); tryPlay(); });
             hls.on(HlsLib.Events.ERROR, (_evt, data) => {
@@ -1151,8 +1156,25 @@
         applyAltText(); // live-update if the lightbox is open
     }
 
+    // Clamp to a sane 1-25 Mbps integer and persist; returns the clamped value so the
+    // input can snap to it. Takes effect on the next video opened (hls reads the
+    // estimate when its instance is built).
+    function setBitrate(v) {
+        let n = parseInt(v, 10);
+        if (isNaN(n)) n = settings.bitrate;
+        n = Math.max(1, Math.min(25, n));
+        settings.bitrate = n;
+        GM_setValue(BITRATE_KEY, n);
+        return n;
+    }
+
     function openSettings() {
         if (document.getElementById(SETTINGS_ID)) return;
+        // Declared up front so its onChange can snap the box to the clamped value.
+        const bitrateInput = el('input', {
+            type: 'number', class: 'bgt-num-input', min: 1, max: 25, step: 1, value: String(settings.bitrate),
+            onChange: () => { bitrateInput.value = String(setBitrate(bitrateInput.value)); },
+        });
         const card = el('div', { class: 'bgt-settings-card' },
             el('h2', {}, 'Gallery settings'),
             el('div', { class: 'bgt-settings-sub' }, 'How should the media grid appear?'),
@@ -1170,6 +1192,11 @@
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.altText, onChange: (e) => setAltText(e.target.checked) }),
                 el('span', {}, 'Show image alt text (accessibility)')),
+            el('div', { class: 'bgt-settings-label' }, 'Video start quality'),
+            el('div', { class: 'bgt-bitrate-row' },
+                bitrateInput,
+                el('span', { class: 'bgt-bitrate-unit' }, 'Mbps')),
+            el('div', { class: 'bgt-settings-hint' }, 'Bandwidth hls.js assumes for the first video segment (1–25). Higher loads sharper sooner; lower it if you ever see stalls.'),
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.debug, onChange: (e) => setDebug(e.target.checked) }),
                 el('span', {}, 'Debug logging to console')),
@@ -1412,6 +1439,14 @@
         #${SETTINGS_ID} .bgt-size-chip:hover { background: rgba(255,255,255,0.04); }
         #${SETTINGS_ID} .bgt-size-chip input { accent-color: #0085ff; }
         #${SETTINGS_ID} .bgt-settings-hint { font-size: 12px; color: #8b98a5; margin: 8px 2px 2px; }
+        #${SETTINGS_ID} .bgt-bitrate-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+        #${SETTINGS_ID} .bgt-num-input {
+            width: 84px; background: #11171f; color: #f1f3f5; border: 1px solid #2a3743;
+            border-radius: 8px; padding: 8px 10px; font-size: 14px; font-weight: 600;
+            accent-color: #0085ff;
+        }
+        #${SETTINGS_ID} .bgt-num-input:focus { outline: none; border-color: #0085ff; }
+        #${SETTINGS_ID} .bgt-bitrate-unit { font-size: 13px; color: #8b98a5; }
         #${SETTINGS_ID} .bgt-check-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 13px; color: #c3ccd6; cursor: pointer; }
         #${SETTINGS_ID} .bgt-check-row input { accent-color: #0085ff; }
         #${SETTINGS_ID} .bgt-settings-foot { display: flex; justify-content: flex-end; margin-top: 12px; }
