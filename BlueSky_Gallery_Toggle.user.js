@@ -4,7 +4,7 @@
 // @author       @quentinwolf.ca
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.8.4
+// @version      2.8.5
 // @license      GPL-3.0-or-later
 // @match        *://bsky.app/*
 // @run-at       document-start
@@ -99,7 +99,7 @@
      *    origin/headers it uses, so our grid sees precisely what you see -
      *    including adult / labeled media. Falls back to the public API.
      * ==================================================================== */
-    const auth = { origin: null, headers: null };
+    const auth = { origin: null, headers: null, stale: false };
 
     function normalizeHeaders(h) {
         const out = {};
@@ -129,8 +129,57 @@
             ['atproto-proxy', 'atproto-accept-labelers', 'accept-language'].forEach(k => {
                 if (h[k]) replay[k] = h[k];
             });
+            const prevTok = auth.headers && auth.headers.authorization;
             auth.headers = replay;
+            // A changed token means the app rotated its session - wake any write
+            // that's waiting to retry, and clear the "stale" flag.
+            if (authz !== prevTok) notifyTokenRefreshed();
         } catch (e) { /* ignore */ }
+    }
+
+    /* ----------------------------------------------------------------------
+     * Stale-token recovery. The borrowed Bearer token expires if the gallery
+     * sits open while the app isn't actively refreshing. We never mint tokens
+     * ourselves - using the app's single-use refresh token could silently log it
+     * out - so "recovery" means waiting briefly for the app to rotate its own
+     * token, which captureAuth then hands us. One shared, time-boxed wait backs
+     * every failed write, so a burst of failures can't hammer the API and nothing
+     * loops: one wait, one retry, then we stop until the next token arrives.
+     * -------------------------------------------------------------------- */
+    const REFRESH_WAIT_MS = 4000;   // how long to wait for the app to rotate its token
+    let freshTokenWaiters = [];     // resolve callbacks awaiting a newer token
+    let refreshWait = null;         // the single in-flight wait promise
+
+    const currentToken = () => (auth.headers && auth.headers.authorization) || null;
+
+    // Called by captureAuth whenever the app hands us a different token.
+    function notifyTokenRefreshed() {
+        auth.stale = false;
+        if (!freshTokenWaiters.length) return;
+        const ws = freshTokenWaiters; freshTokenWaiters = [];
+        ws.forEach(fn => { try { fn(true); } catch (_) { /* ignore */ } });
+    }
+
+    // Resolve true if a token newer than `staleTok` is (or becomes, within the
+    // window) available; false on timeout. Deduped: concurrent callers share one
+    // wait, so N failed writes still trigger at most one wait apiece.
+    function waitForFreshToken(staleTok) {
+        const tok = currentToken();
+        if (tok && tok !== staleTok) return Promise.resolve(true); // already rotated
+        if (refreshWait) return refreshWait;
+        refreshWait = new Promise(resolve => {
+            let done = false;
+            const finish = (ok) => {
+                if (done) return; done = true;
+                clearTimeout(timer);
+                freshTokenWaiters = freshTokenWaiters.filter(fn => fn !== finish);
+                refreshWait = null;
+                resolve(ok);
+            };
+            const timer = setTimeout(() => { auth.stale = true; finish(false); }, REFRESH_WAIT_MS);
+            freshTokenWaiters.push(finish);
+        });
+        return refreshWait;
     }
 
     function installFetchHook() {
@@ -322,6 +371,11 @@
     // app.bsky.actor.getProfile. followUri is the viewer's follow-record URI (the
     // handle for unfollow) or null; isMe suppresses the button on your own profile.
     const profile = { actor: null, did: null, handle: null, displayName: '', followUri: null, isMe: false, _busyFollow: false };
+    // Our last local follow/unfollow, kept across remounts so a not-yet-indexed
+    // AppView read can't bounce the button back. uri = follow-record URI, or null
+    // when we just unfollowed. Trusted over the AppView for FOLLOW_TRUST_MS.
+    const FOLLOW_TRUST_MS = 15000;
+    const recentFollow = { did: null, uri: null, at: 0 };
 
     // One Follow/Following pill, reused by the header bar and the lightbox. Starts
     // hidden; updateFollowButton()/updateFollowVisibility() drive its state + display.
@@ -630,13 +684,47 @@
         const res = await nativeFetch(auth.origin + '/xrpc/' + method, {
             method: 'POST', headers, body: JSON.stringify(body), credentials: 'omit',
         });
-        if (!res.ok) throw new Error(method + ' ' + res.status);
         const text = await res.text();
+        if (!res.ok) {
+            // Surface the atproto error name (e.g. ExpiredToken) so callers can tell
+            // a dead session from a genuine failure.
+            let name = '';
+            try { name = (JSON.parse(text) || {}).error || ''; } catch (_) { /* non-JSON body */ }
+            const err = new Error(method + ' ' + res.status + (name ? ' (' + name + ')' : ''));
+            err.status = res.status; err.xrpcError = name;
+            throw err;
+        }
         try { return text ? JSON.parse(text) : {}; } catch (_) { return {}; }
     }
+
+    // Atproto error shapes that mean "this token is no longer valid".
+    function isAuthError(e) {
+        if (!e) return false;
+        const name = String(e.xrpcError || '').toLowerCase();
+        if (name === 'expiredtoken' || name === 'invalidtoken' ||
+            name === 'authmissing' || name === 'authenticationrequired') return true;
+        return e.status === 401 || e.status === 403;
+    }
+
+    // A write with one-shot stale-token recovery: try once; on an auth error wait
+    // once for the app to rotate its token, then retry at most once. A non-auth
+    // error, or a second auth failure, bubbles straight to the caller (which rolls
+    // the optimistic UI back). This can never loop or retry blindly - we only retry
+    // after a genuinely newer token has arrived.
+    async function xrpcWrite(method, body, useProxy) {
+        const used = currentToken();
+        try {
+            return await xrpcPost(method, body, useProxy);
+        } catch (e) {
+            if (!isAuthError(e)) throw e;
+            const fresh = await waitForFreshToken(used);
+            if (!fresh) { auth.stale = true; throw e; }
+            return xrpcPost(method, body, useProxy); // exactly one retry, no further catch
+        }
+    }
     const rkeyOf = (uri) => String(uri).split('/').pop();
-    const repoCreate = (repo, collection, record) => xrpcPost('com.atproto.repo.createRecord', { repo, collection, record }, false);
-    const repoDelete = (repo, collection, rkey) => xrpcPost('com.atproto.repo.deleteRecord', { repo, collection, rkey }, false);
+    const repoCreate = (repo, collection, record) => xrpcWrite('com.atproto.repo.createRecord', { repo, collection, record }, false);
+    const repoDelete = (repo, collection, rkey) => xrpcWrite('com.atproto.repo.deleteRecord', { repo, collection, rkey }, false);
 
     // Abbreviate like Bluesky: 999 -> "999", 1200 -> "1.2K", 0 -> "" (icon only).
     function fmtCount(n) {
@@ -656,6 +744,10 @@
         const date = d.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
         return time + ' · ' + date;
     }
+
+    // Appended to a failure log when the borrowed session has gone stale, so the
+    // console says what to do rather than just dumping an opaque error.
+    const staleHint = () => auth.stale ? ' (session token expired - refresh the page)' : '';
 
     // Each toggle flips the UI optimistically, fires the write, and rolls back on
     // failure. Without a writable session we just open the post so the user can act
@@ -680,7 +772,7 @@
                 if (!st.likeUri) throw new Error('no uri returned');
             }
         } catch (e) {
-            console.error('[Gallery Toggle] like failed:', e);
+            console.error('[Gallery Toggle] like failed' + staleHint() + ':', e);
             st.likeUri = prev;
             st.likeCount = Math.max(0, st.likeCount + (was ? 1 : -1));
         } finally {
@@ -709,7 +801,7 @@
                 if (!st.repostUri) throw new Error('no uri returned');
             }
         } catch (e) {
-            console.error('[Gallery Toggle] repost failed:', e);
+            console.error('[Gallery Toggle] repost failed' + staleHint() + ':', e);
             st.repostUri = prev;
             st.repostCount = Math.max(0, st.repostCount + (was ? 1 : -1));
         } finally {
@@ -727,10 +819,10 @@
         st.bookmarked = !was;
         updateActionBar();
         try {
-            if (was) await xrpcPost('app.bsky.bookmark.deleteBookmark', { uri: st.uri }, true);
-            else await xrpcPost('app.bsky.bookmark.createBookmark', { uri: st.uri, cid: st.cid }, true);
+            if (was) await xrpcWrite('app.bsky.bookmark.deleteBookmark', { uri: st.uri }, true);
+            else await xrpcWrite('app.bsky.bookmark.createBookmark', { uri: st.uri, cid: st.cid }, true);
         } catch (e) {
-            console.error('[Gallery Toggle] bookmark failed:', e);
+            console.error('[Gallery Toggle] bookmark failed' + staleHint() + ':', e);
             st.bookmarked = was;
         } finally {
             st._busyBm = false;
@@ -771,7 +863,16 @@
         profile.did = data.did || null;
         profile.handle = data.handle || null;
         profile.displayName = data.displayName || '';
-        profile.followUri = (data.viewer && data.viewer.following) || null;
+        // Follow state: only the authed AppView carries a viewer block; the public
+        // fallback can't see follows, so never let it null out a known follow. And
+        // within FOLLOW_TRUST_MS of a local write (or while one's in flight), trust
+        // our own result over a possibly-lagging AppView read - covers both follow
+        // and unfollow, and stops a stale read from re-triggering a duplicate write.
+        if (data.viewer && !profile._busyFollow) {
+            const recent = recentFollow.did && recentFollow.did === profile.did &&
+                           (Date.now() - recentFollow.at) < FOLLOW_TRUST_MS;
+            profile.followUri = recent ? recentFollow.uri : (data.viewer.following || null);
+        }
         const me = getMyDid();
         profile.isMe = !!(me && profile.did && me === profile.did);
         logDebug('profile loaded handle=' + profile.handle + ' following=' + !!profile.followUri + ' isMe=' + profile.isMe);
@@ -859,8 +960,11 @@
                 profile.followUri = (r && r.uri) || null;
                 if (!profile.followUri) throw new Error('no uri returned');
             }
+            // Remember the authoritative local result so a lagging getProfile on a
+            // remount can't revert it (and we don't fire a duplicate follow).
+            recentFollow.did = profile.did; recentFollow.uri = profile.followUri; recentFollow.at = Date.now();
         } catch (e) {
-            console.error('[Gallery Toggle] follow failed:', e);
+            console.error('[Gallery Toggle] follow failed' + staleHint() + ':', e);
             profile.followUri = prev;
         } finally {
             profile._busyFollow = false;
