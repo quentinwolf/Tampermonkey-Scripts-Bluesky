@@ -5,12 +5,12 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.7.9
+// @version      2.8.1
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        unsafeWindow
-// @require      https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js
+// @require      https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js    // for in-lightbox video playback (including .m3u8 from the API and Tenor/Giphy GIFs that come in as external embeds)
 // @downloadURL  https://github.com/quentinwolf/Tampermonkey-Scripts/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
 // @updateURL    https://github.com/quentinwolf/Tampermonkey-Scripts/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
 // ==/UserScript==
@@ -54,6 +54,7 @@
     const ICON_GEAR = 'M19.14 12.94c.04-.3.06-.62.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.48.48 0 0 0-.59.22L2.74 8.87a.48.48 0 0 0 .12.61l2.03 1.58c-.05.3-.07.62-.07.94 0 .32.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.13.22.39.3.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.03-1.58zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2z';
     const ICON_EXT = 'M14 3h7v7h-2V6.41l-9.29 9.3-1.42-1.42 9.3-9.29H14V3zM5 5h5v2H7v10h10v-3h2v5H5V5z';
     const ICON_PLAY = 'M8 5v14l11-7z';
+    const ICON_PLUS = 'M11 5a1 1 0 0 1 2 0v6h6a1 1 0 1 1 0 2h-6v6a1 1 0 1 1-2 0v-6H5a1 1 0 1 1 0-2h6V5z';
 
     // Post-action icons (lifted from Bluesky's own buttons so the lightbox bar
     // matches the native look). Heart + bookmark have a filled variant for the
@@ -315,9 +316,15 @@
     };
     let rootEl, scrollEl, gridEl, sentinelEl, countEl, io, overlayKeyHandler;
     let mountedMode = null, inlineHost = null, inlineResizeHandler = null;
+    let headerTitleEl = null, followBtn = null, inlineScrollHandler = null, followVisTick = false;
+    // Viewed profile's identity + follow state, populated by loadProfile() from
+    // app.bsky.actor.getProfile. followUri is the viewer's follow-record URI (the
+    // handle for unfollow) or null; isMe suppresses the button on your own profile.
+    const profile = { actor: null, did: null, handle: null, displayName: '', followUri: null, isMe: false, _busyFollow: false };
 
     function buildHeader(actor) {
         const title = el('div', { class: 'bgt-title' }, actor.startsWith('did:') ? actor : '@' + actor);
+        headerTitleEl = title; // loadProfile() swaps a raw did for the resolved @handle
         const sub = el('div', { class: 'bgt-sub' }, grid.videosOnly ? 'Video gallery' : 'Media gallery');
         countEl = el('div', { class: 'bgt-sub bgt-count' }, '');
 
@@ -328,11 +335,25 @@
             href: 'https://bsky.app/profile/' + actor,
         }, svgIcon(ICON_EXT, 20, 20));
 
+        // Follow / Following toggle. Hidden until loadProfile() confirms a writable
+        // session, a resolved DID, and that this isn't your own profile; in in-line
+        // mode it also stays hidden until the bar pins to the top, so it never doubles
+        // up with the profile's own follow button while the bio is still on screen.
+        const followPlus = svgIcon(ICON_PLUS, 15, 15);
+        followPlus.classList.add('bgt-fl-plus');
+        followBtn = el('button', {
+            class: 'bgt-followbtn', type: 'button', style: { display: 'none' },
+            onClick: (e) => { e.preventDefault(); e.stopPropagation(); toggleFollow(); },
+        }, followPlus,
+            el('span', { class: 'bgt-fl-follow' }, 'Follow'),
+            el('span', { class: 'bgt-fl-following' }, 'Following'),
+            el('span', { class: 'bgt-fl-unfollow' }, 'Unfollow'));
+
         return el('div', { class: 'bgt-header' },
             closeBtn,
             el('div', { class: 'bgt-titlewrap' }, title, el('div', { class: 'bgt-subrow' }, sub, countEl)),
             el('div', { class: 'bgt-spacer' }),
-            gearBtn, openProfile
+            followBtn, gearBtn, openProfile
         );
     }
 
@@ -451,8 +472,13 @@
         scrollEl = null;
         mountedMode = 'inline';
         applyInlineSticky(); // pin our header beneath Bluesky's tab bar
-        inlineResizeHandler = () => applyInlineSticky();
+        inlineResizeHandler = () => { applyInlineSticky(); scheduleFollowVis(); };
         window.addEventListener('resize', inlineResizeHandler);
+        // Reveal the follow button as the bar nears the top. Capture phase (not bubbling)
+        // so we still catch the scroll when Bluesky scrolls an inner overflow container -
+        // those scroll events don't bubble to window, but they do fire during capture.
+        inlineScrollHandler = () => scheduleFollowVis();
+        window.addEventListener('scroll', inlineScrollHandler, { passive: true, capture: true });
         return true;
     }
 
@@ -701,6 +727,124 @@
         } finally {
             st._busyBm = false;
             updateActionBar();
+        }
+    }
+
+    /* ======================================================================
+     * 4c. Profile identity + follow toggle (header bar).
+     *
+     *     One getProfile call per gallery resolves the @handle (so a /profile/did:…
+     *     URL shows a name, not the raw DID) and reads the viewer's follow state.
+     *     Follows are repo records (app.bsky.graph.follow) on your PDS, just like
+     *     likes/reposts - the subject is the target DID, and the returned record URI
+     *     is what we delete to unfollow.
+     * ==================================================================== */
+    async function fetchProfile(actor) {
+        const path = '/xrpc/app.bsky.actor.getProfile?actor=' + encodeURIComponent(actor);
+        // Authed first so viewer.following comes back; fall back to the public AppView
+        // (handle/displayName only - no follow state without a session).
+        if (auth.origin && auth.headers) {
+            try {
+                const res = await nativeFetch(auth.origin + path, { headers: auth.headers, credentials: 'omit' });
+                if (res.ok) return res.json();
+            } catch (e) { /* fall through to public */ }
+        }
+        try {
+            const res = await nativeFetch(PUBLIC_API + path, { headers: { 'accept-language': navigator.language || 'en' } });
+            if (res.ok) return res.json();
+        } catch (e) { /* ignore */ }
+        return null;
+    }
+
+    async function loadProfile(actor) {
+        let data;
+        try { data = await fetchProfile(actor); } catch (e) { data = null; }
+        if (!data || grid.actor !== actor) return; // gallery closed or switched while we waited
+        profile.did = data.did || null;
+        profile.handle = data.handle || null;
+        profile.displayName = data.displayName || '';
+        profile.followUri = (data.viewer && data.viewer.following) || null;
+        const me = getMyDid();
+        profile.isMe = !!(me && profile.did && me === profile.did);
+        logDebug('profile loaded handle=' + profile.handle + ' following=' + !!profile.followUri + ' isMe=' + profile.isMe);
+        updateHeaderIdentity();
+        updateFollowButton();
+        updateFollowVisibility();
+    }
+
+    // Swap the raw DID shown in the title for the resolved @handle once we have it.
+    function updateHeaderIdentity() {
+        if (headerTitleEl && profile.handle) headerTitleEl.textContent = '@' + profile.handle;
+    }
+
+    // Paint the follow button's state. The label swap (+ Follow / Following / Unfollow)
+    // and colours live in CSS, keyed off the bgt-following class; 'pending' counts as
+    // following so the optimistic flip sticks while the write is in flight.
+    function updateFollowButton() {
+        if (!followBtn) return;
+        const following = !!profile.followUri;
+        followBtn.classList.toggle('bgt-following', following);
+        followBtn.title = (following ? 'Unfollow @' : 'Follow @') + (profile.handle || '');
+    }
+
+    // True once the sticky bar has risen near the top of the viewport - i.e. it's pinned
+    // just under Bluesky's profile tab bar, by which point the bio (with its own follow
+    // button, only in the top ~200px of the page) has scrolled away. The bar mounts ~425px
+    // down, so there's ample slack before the native button would overlap; a generous
+    // margin over the measured tab-bar height (~50px) absorbs browser/OS scaling and any
+    // case where stickyTabBarHeight() reads small.
+    function headerNearTop() {
+        if (!rootEl) return false;
+        const header = rootEl.querySelector('.bgt-header');
+        if (!header) return false;
+        return header.getBoundingClientRect().top <= stickyTabBarHeight() + 120;
+    }
+
+    function updateFollowVisibility() {
+        if (!followBtn) return;
+        // Only meaningful with a writable session, a known DID, and not your own profile.
+        const eligible = !!getMyDid() && !!profile.did && !profile.isMe;
+        // Full screen hides the bio entirely, so the button is always welcome there;
+        // in-line shows it only once the bar nears the top (else it would duplicate the
+        // bio's own follow button while the bio is still on screen).
+        const show = eligible && (mountedMode !== 'inline' || headerNearTop());
+        followBtn.style.display = show ? '' : 'none';
+    }
+
+    // Scroll fires often; collapse a burst into one rAF-aligned visibility check.
+    function scheduleFollowVis() {
+        if (followVisTick) return;
+        followVisTick = true;
+        requestAnimationFrame(() => { followVisTick = false; updateFollowVisibility(); });
+    }
+
+    // Optimistic follow/unfollow, mirroring toggleLike/toggleRepost: flip the UI now,
+    // fire the write, roll back on failure. Without a writable session we just open the
+    // profile so the user can act natively. _busyFollow guards against double-taps.
+    async function toggleFollow() {
+        if (!profile || profile._busyFollow) return;
+        const did = getMyDid();
+        if (!did || !profile.did) { unsafeWindow.open('https://bsky.app/profile/' + (profile.handle || profile.did || ''), '_blank', 'noopener'); return; }
+        profile._busyFollow = true;
+        const was = !!profile.followUri, prev = profile.followUri;
+        profile.followUri = was ? null : 'pending';
+        updateFollowButton();
+        try {
+            if (was) {
+                await repoDelete(did, 'app.bsky.graph.follow', rkeyOf(prev));
+                profile.followUri = null;
+            } else {
+                const r = await repoCreate(did, 'app.bsky.graph.follow',
+                    { '$type': 'app.bsky.graph.follow', subject: profile.did, createdAt: new Date().toISOString() });
+                profile.followUri = (r && r.uri) || null;
+                if (!profile.followUri) throw new Error('no uri returned');
+            }
+        } catch (e) {
+            console.error('[Gallery Toggle] follow failed:', e);
+            profile.followUri = prev;
+        } finally {
+            profile._busyFollow = false;
+            updateFollowButton();
         }
     }
 
@@ -1257,9 +1401,14 @@
         grid.items = [];
         grid.seen = new Set();
 
+        // Reset per-profile identity/follow state; loadProfile() fills it in async.
+        profile.actor = actor; profile.did = null; profile.handle = null;
+        profile.displayName = ''; profile.followUri = null; profile.isMe = false; profile._busyFollow = false;
+
         gridEl = el('div', { class: 'bgt-grid' });
         sentinelEl = el('div', { class: 'bgt-sentinel' }, el('div', { class: 'bgt-spinner' }));
         pendingHeader = buildHeader(actor); // reads grid.videosOnly, set just above
+        loadProfile(actor);                 // resolve @handle + follow state (async)
 
         if (settings.mode === 'inline') {
             // On a fresh load the feed isn't painted yet, so defer until it is.
@@ -1283,6 +1432,7 @@
         document.addEventListener('keydown', overlayKeyHandler);
 
         loadMore();
+        updateFollowVisibility(); // header is mounted now; reflect the current pin state
     }
 
     function waitForInlineHost(actor, videosOnly) {
@@ -1323,6 +1473,7 @@
     function removeOverlay() {
         stopWaiting();
         if (inlineResizeHandler) { window.removeEventListener('resize', inlineResizeHandler); inlineResizeHandler = null; }
+        if (inlineScrollHandler) { window.removeEventListener('scroll', inlineScrollHandler, true); inlineScrollHandler = null; }
         pendingHeader = null;
         closeLightbox();
         if (lbEl) { lbEl.remove(); lbEl = null; }
@@ -1333,6 +1484,8 @@
         mountedMode = null;
         grid.actor = null;
         scrollEl = gridEl = sentinelEl = countEl = null;
+        headerTitleEl = followBtn = null;
+        profile.actor = null;
     }
 
     function remountGallery() {
@@ -1623,6 +1776,29 @@
             cursor: pointer; font-size: 20px; line-height: 1; text-decoration: none;
         }
         .bgt-iconbtn:hover { background: rgba(127,127,127,0.18); }
+
+        /* ---- header follow / following button ---- */
+        #${OVERLAY_ID} .bgt-followbtn {
+            display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 16px;
+            border: none; border-radius: 999px; cursor: pointer; white-space: nowrap;
+            font-size: 14px; font-weight: 600; line-height: 1;
+            font-family: InterVariable, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, sans-serif;
+            background: ${ACCENT}; color: #fff; transition: background-color 120ms ease, color 120ms ease;
+        }
+        #${OVERLAY_ID} .bgt-followbtn:hover { background: #2f93f0; }
+        #${OVERLAY_ID} .bgt-followbtn svg { display: block; }
+        /* Following: neutral grey pill (inherits the theme's text colour so it reads on
+           light AND dark); hovering it reveals the red "Unfollow" cue. */
+        #${OVERLAY_ID} .bgt-followbtn.bgt-following { background: rgba(127,127,127,0.22); color: inherit; }
+        #${OVERLAY_ID} .bgt-followbtn.bgt-following:hover { background: rgba(244,33,46,0.14); color: #f4212e; }
+        /* Label/icon visibility is state-driven: "+ Follow" / "Following" / (hover) "Unfollow". */
+        #${OVERLAY_ID} .bgt-followbtn .bgt-fl-following,
+        #${OVERLAY_ID} .bgt-followbtn .bgt-fl-unfollow { display: none; }
+        #${OVERLAY_ID} .bgt-followbtn.bgt-following .bgt-fl-plus,
+        #${OVERLAY_ID} .bgt-followbtn.bgt-following .bgt-fl-follow { display: none; }
+        #${OVERLAY_ID} .bgt-followbtn.bgt-following .bgt-fl-following { display: inline; }
+        #${OVERLAY_ID} .bgt-followbtn.bgt-following:hover .bgt-fl-following { display: none; }
+        #${OVERLAY_ID} .bgt-followbtn.bgt-following:hover .bgt-fl-unfollow { display: inline; }
 
         #${OVERLAY_ID} .bgt-scroll { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; }
         #${OVERLAY_ID} .bgt-inner { max-width: 1200px; margin: 0 auto; padding: 8px; }
