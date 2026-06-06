@@ -5,7 +5,7 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.7.0
+// @version      2.7.5
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -32,6 +32,9 @@
     const POSTINFO_KEY = 'bsky-gallery-postinfo';    // boolean: post text in lightbox
     const ALT_KEY = 'bsky-gallery-alt';              // boolean: image alt text in lightbox
     const CONTINUOUS_KEY = 'bsky-gallery-continuous';// boolean: lightbox arrows cross posts
+    const WHEEL_KEY = 'bsky-gallery-wheel';          // boolean: master switch for wheel features
+    const WHEELACTION_KEY = 'bsky-gallery-wheelact'; // 'navigate' | 'zoom' | 'none' over the image
+    const WHEELREV_KEY = 'bsky-gallery-wheelrev';    // boolean: invert wheel direction
     const BITRATE_KEY = 'bsky-gallery-bitrate';      // number: video start-quality guess, Mbps (1-25)
     const PAGE_LIMIT = 100;                          // max getAuthorFeed page size
     const PUBLIC_API = 'https://public.api.bsky.app'; // unauthenticated fallback
@@ -68,6 +71,9 @@
         postInfo: GM_getValue(POSTINFO_KEY, false),
         altText: GM_getValue(ALT_KEY, false),
         continuousNav: GM_getValue(CONTINUOUS_KEY, true),
+        wheel: GM_getValue(WHEEL_KEY, false),
+        wheelAction: GM_getValue(WHEELACTION_KEY, 'navigate'),
+        wheelReverse: GM_getValue(WHEELREV_KEY, false),
         bitrate: GM_getValue(BITRATE_KEY, 5),
     };
 
@@ -800,6 +806,12 @@
             close, lbThumbs, lbPrev, el('div', { class: 'bgt-lb-stage' }, lbImg, lbVideo), lbNext, bar);
         document.body.appendChild(lbEl);
 
+        // Mouse-wheel (navigate / flip thumbnails / zoom) + cursor-follow pan. Both are
+        // gated on the settings at event time, so they're inert until enabled. passive:
+        // false lets us stop the page behind the lightbox from scrolling.
+        lbEl.addEventListener('wheel', lbWheel, { passive: false });
+        lbImg.addEventListener('mousemove', lbImgPan);
+
         // stopImmediatePropagation + window-capture so we win over Bluesky's own
         // arrow-key shortcuts (which listen on document and would otherwise eat them).
         lbKeyHandler = (e) => {
@@ -813,6 +825,7 @@
         const it = grid.items[lbIndex];
         if (!it) return;
         teardownVideo(); // stop/detach whatever was playing before we switch slots
+        resetZoom();     // every item starts unzoomed
         const isVideo = it.kind === 'video';
         lbEl.classList.toggle('bgt-has-video', isVideo);
         if (isVideo) {
@@ -832,6 +845,7 @@
             lbImg.style.display = 'block';
             lbImg.src = it.full;
             lbImg.alt = it.alt || '';
+            lbImg.style.cursor = (settings.wheel && settings.wheelAction === 'zoom') ? 'zoom-in' : '';
         }
         lbLink.href = it.url;
         updateNavButtons();
@@ -990,6 +1004,85 @@
         lbIndex = n;
         showLightbox();
         if (settings.continuousNav && n >= grid.items.length - 4) maybeLoadMore(); // keep nav going near the end
+    }
+
+    // Step strictly within the current post's image group, regardless of the
+    // continuous-nav setting (used by the thumbnail-strip wheel).
+    function navWithinPost(d) {
+        const [lo, hi] = postGroupRange(lbIndex);
+        const n = lbIndex + d;
+        if (n < lo || n > hi) return;
+        lbIndex = n;
+        showLightbox();
+    }
+
+    /* ---- mouse-wheel: navigate / flip thumbnails / zoom (all opt-in) ---- */
+    let lbZoom = 1, wheelAccum = 0, wheelTs = 0, wheelDir = 0;
+
+    function resetZoom() {
+        if (!lbImg) return;
+        lbZoom = 1;
+        lbImg.style.transform = '';
+        lbImg.style.transformOrigin = '';
+        lbImg.style.cursor = '';
+    }
+
+    // Point the scale transform at the cursor (as a % of the image box), clamped so
+    // panning never runs past the edges.
+    function setZoomOrigin(e) {
+        const r = lbImg.getBoundingClientRect();
+        if (!r.width || !r.height) return;
+        const x = Math.min(100, Math.max(0, ((e.clientX - r.left) / r.width) * 100));
+        const y = Math.min(100, Math.max(0, ((e.clientY - r.top) / r.height) * 100));
+        lbImg.style.transformOrigin = x + '% ' + y + '%';
+    }
+
+    function zoomByWheel(e, dir) {
+        setZoomOrigin(e); // zoom toward the cursor
+        lbZoom = Math.max(1, Math.min(5, lbZoom + (dir < 0 ? 0.5 : -0.5))); // wheel up = in
+        lbImg.style.transform = lbZoom > 1 ? 'scale(' + lbZoom + ')' : '';
+        lbImg.style.cursor = lbZoom > 1 ? 'zoom-out' : 'zoom-in';
+    }
+
+    // While zoomed, follow the cursor so the user can pan without dragging.
+    function lbImgPan(e) {
+        if (lbZoom > 1) setZoomOrigin(e);
+    }
+
+    function lbWheel(e) {
+        // Let the scrollable caption / post-text boxes scroll normally.
+        if (e.target.closest && e.target.closest('.bgt-lb-text, .bgt-lb-cap')) return;
+        e.preventDefault(); // modal: never scroll the page behind the lightbox
+        if (!settings.wheel) return;
+
+        let dy = e.deltaY;
+        if (settings.wheelReverse) dy = -dy;
+        const dir = dy >= 0 ? 1 : -1;
+
+        // What the wheel acts on is decided by what's under the cursor.
+        let mode = 'none';
+        if (e.target.closest && e.target.closest('.bgt-lb-thumbs')) mode = 'thumbs';
+        else if (settings.wheelAction === 'navigate') mode = 'nav';
+        else if (settings.wheelAction === 'zoom') {
+            const it = grid.items[lbIndex];
+            if (it && it.kind === 'image' && e.target.closest && e.target.closest('.bgt-lb-stage')) mode = 'zoom';
+        }
+        if (mode === 'none') return;
+
+        if (mode === 'zoom') { zoomByWheel(e, dir); return; }
+
+        // Navigation: accumulate delta so one mouse notch = one image, and neither
+        // trackpads (many tiny deltas) nor free-spin wheels (event bursts) fly past
+        // several at once. deltaMode normalises line/page wheels to ~pixels.
+        const now = Date.now();
+        if (now - wheelTs > 220 || dir !== wheelDir) { wheelAccum = 0; wheelDir = dir; }
+        wheelTs = now;
+        let unit = Math.abs(dy) || 0;
+        if (e.deltaMode === 1) unit *= 33; else if (e.deltaMode === 2) unit *= 400;
+        wheelAccum += unit;
+        if (wheelAccum < 90) return;
+        wheelAccum = 0;
+        if (mode === 'thumbs') navWithinPost(dir); else navLightbox(dir);
     }
 
     function closeLightbox() {
@@ -1187,6 +1280,14 @@
         return el('label', { class: 'bgt-size-chip' }, input, label);
     }
 
+    function wheelActionRadio(value, label) {
+        const input = el('input', {
+            type: 'radio', name: 'bgt-wheelaction', value: value, checked: settings.wheelAction === value,
+            onChange: () => setWheelAction(value),
+        });
+        return el('label', { class: 'bgt-size-chip' }, input, label);
+    }
+
     function setSize(s) {
         if (settings.size === s) return;
         settings.size = s;
@@ -1225,6 +1326,25 @@
         if (lbEl && lbEl.style.display !== 'none') updateNavButtons(); // live: refresh the arrows
     }
 
+    function setWheel(on) {
+        settings.wheel = !!on;
+        GM_setValue(WHEEL_KEY, settings.wheel);
+        if (!settings.wheel) resetZoom(); // turning it off clears any active zoom
+    }
+
+    function setWheelAction(v) {
+        settings.wheelAction = v;
+        GM_setValue(WHEELACTION_KEY, v);
+        resetZoom(); // switching modes drops any current zoom
+        if (lbImg && lbImg.style.display !== 'none')
+            lbImg.style.cursor = (settings.wheel && v === 'zoom') ? 'zoom-in' : '';
+    }
+
+    function setWheelReverse(on) {
+        settings.wheelReverse = !!on;
+        GM_setValue(WHEELREV_KEY, settings.wheelReverse);
+    }
+
     // Clamp to a sane 1-25 Mbps integer and persist; returns the clamped value so the
     // input can snap to it. Takes effect on the next video opened (hls reads the
     // estimate when its instance is built).
@@ -1244,6 +1364,18 @@
             type: 'number', class: 'bgt-num-input', min: 1, max: 25, step: 1, value: String(settings.bitrate),
             onChange: () => { bitrateInput.value = String(setBitrate(bitrateInput.value)); },
         });
+        // Wheel sub-options, kept in their own block so the master checkbox can reveal
+        // or hide them in place.
+        const wheelSub = el('div', { class: 'bgt-wheel-sub', style: { display: settings.wheel ? 'block' : 'none' } },
+            el('div', { class: 'bgt-settings-label' }, 'Wheel over image'),
+            el('div', { class: 'bgt-size-group' },
+                wheelActionRadio('navigate', 'Navigate'),
+                wheelActionRadio('zoom', 'Zoom'),
+                wheelActionRadio('none', 'None')),
+            el('label', { class: 'bgt-check-row' },
+                el('input', { type: 'checkbox', checked: settings.wheelReverse, onChange: (e) => setWheelReverse(e.target.checked) }),
+                el('span', {}, 'Reverse wheel direction')),
+            el('div', { class: 'bgt-settings-hint' }, 'Scroll the thumbnail strip to flip within a post; over the image the wheel does the action chosen above.'));
         const card = el('div', { class: 'bgt-settings-card' },
             el('h2', {}, 'Gallery settings'),
             el('div', { class: 'bgt-settings-sub' }, 'How should the media grid appear?'),
@@ -1265,6 +1397,10 @@
                 el('input', { type: 'checkbox', checked: settings.continuousNav, onChange: (e) => setContinuousNav(e.target.checked) }),
                 el('span', {}, 'Continuous navigation across posts')),
             el('div', { class: 'bgt-settings-hint' }, 'On: arrows flow through every image. Off: arrows stay within a post’s images — use the thumbnail strip (shown for 2–4 image posts) to jump between them.'),
+            el('label', { class: 'bgt-check-row' },
+                el('input', { type: 'checkbox', checked: settings.wheel, onChange: (e) => { setWheel(e.target.checked); wheelSub.style.display = e.target.checked ? 'block' : 'none'; } }),
+                el('span', {}, 'Enable mouse-wheel features')),
+            wheelSub,
             el('div', { class: 'bgt-settings-label' }, 'Video start quality'),
             el('div', { class: 'bgt-bitrate-row' },
                 bitrateInput,
@@ -1429,7 +1565,7 @@
             position: fixed; inset: 0; z-index: 99999; background: rgba(0,0,0,0.93);
             display: none; align-items: center; justify-content: center;
         }
-        #${LIGHTBOX_ID} .bgt-lb-stage { display: flex; align-items: center; justify-content: center; }
+        #${LIGHTBOX_ID} .bgt-lb-stage { display: flex; align-items: center; justify-content: center; overflow: hidden; }
         #${LIGHTBOX_ID} .bgt-lbimg { max-width: 94vw; max-height: 90vh; object-fit: contain; border-radius: 4px; }
         #${LIGHTBOX_ID} .bgt-lbvideo { max-width: 94vw; max-height: 90vh; object-fit: contain; border-radius: 4px; background: #000; }
         /* A definite box, sized by the video's aspect ratio, so the player fills the
@@ -1543,6 +1679,7 @@
         }
         #${SETTINGS_ID} .bgt-num-input:focus { outline: none; border-color: #0085ff; }
         #${SETTINGS_ID} .bgt-bitrate-unit { font-size: 13px; color: #8b98a5; }
+        #${SETTINGS_ID} .bgt-wheel-sub { margin: 6px 0 2px 4px; padding-left: 10px; border-left: 2px solid #2a3743; }
         #${SETTINGS_ID} .bgt-check-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 13px; color: #c3ccd6; cursor: pointer; }
         #${SETTINGS_ID} .bgt-check-row input { accent-color: #0085ff; }
         #${SETTINGS_ID} .bgt-settings-foot { display: flex; justify-content: flex-end; margin-top: 12px; }
