@@ -5,7 +5,7 @@
 // @match        *://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf
-// @version      2.7.5
+// @version      2.7.6
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -1017,7 +1017,7 @@
     }
 
     /* ---- mouse-wheel: navigate / flip thumbnails / zoom (all opt-in) ---- */
-    let lbZoom = 1, wheelAccum = 0, wheelTs = 0, wheelDir = 0;
+    let lbZoom = 1, wheelLastEvent = 0, wheelLastStep = 0, wheelDir = 0;
 
     function resetZoom() {
         if (!lbImg) return;
@@ -1057,7 +1057,11 @@
 
         let dy = e.deltaY;
         if (settings.wheelReverse) dy = -dy;
-        const dir = dy >= 0 ? 1 : -1;
+        // Normalise line/page wheels toward pixels, only to gate out 0/jitter events
+        // (e.g. a horizontal-only scroll reporting deltaY 0).
+        const mag = Math.abs(dy) * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 100 : 1);
+        if (mag < 1) return;
+        const dir = dy > 0 ? 1 : -1;
 
         // What the wheel acts on is decided by what's under the cursor.
         let mode = 'none';
@@ -1071,17 +1075,19 @@
 
         if (mode === 'zoom') { zoomByWheel(e, dir); return; }
 
-        // Navigation: accumulate delta so one mouse notch = one image, and neither
-        // trackpads (many tiny deltas) nor free-spin wheels (event bursts) fly past
-        // several at once. deltaMode normalises line/page wheels to ~pixels.
+        // One notch -> one image, independent of how big a delta the mouse reports
+        // (the old "sum pixels to a threshold" approach took ~3 clicks on low-delta
+        // mice and could double-step from leftover accumulation). Instead, detect a
+        // fresh notch by a gap since the previous wheel event: a ratcheted click - or a
+        // tight burst of tiny events from a high-res wheel - counts once. A continuous
+        // stream (trackpad / free-spin coast) still advances, but capped to a steady
+        // cadence so it can't fly past several at once.
         const now = Date.now();
-        if (now - wheelTs > 220 || dir !== wheelDir) { wheelAccum = 0; wheelDir = dir; }
-        wheelTs = now;
-        let unit = Math.abs(dy) || 0;
-        if (e.deltaMode === 1) unit *= 33; else if (e.deltaMode === 2) unit *= 400;
-        wheelAccum += unit;
-        if (wheelAccum < 90) return;
-        wheelAccum = 0;
+        const newNotch = (now - wheelLastEvent) > 60 || dir !== wheelDir;
+        wheelLastEvent = now;
+        wheelDir = dir;
+        if (!newNotch && (now - wheelLastStep) < 180) return;
+        wheelLastStep = now;
         if (mode === 'thumbs') navWithinPost(dir); else navLightbox(dir);
     }
 
