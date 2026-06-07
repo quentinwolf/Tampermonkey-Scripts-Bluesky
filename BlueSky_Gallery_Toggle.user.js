@@ -7,13 +7,13 @@
 // @version      2.8.7
 // @license      GPL-3.0-or-later
 // @match        *://bsky.app/*
+// @require      https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js
+// @downloadURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
+// @updateURL    https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        unsafeWindow
-// @require      https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js
-// @downloadURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
-// @updateURL    https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
 // ==/UserScript==
 
 (function () {
