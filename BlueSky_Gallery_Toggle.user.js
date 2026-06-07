@@ -1073,6 +1073,12 @@
         lbPrev = el('button', { class: 'bgt-iconbtn bgt-lb-nav bgt-lb-prev', title: 'Previous', onClick: (e) => { e.stopPropagation(); navLightbox(-1); } }, '‹');
         lbNext = el('button', { class: 'bgt-iconbtn bgt-lb-nav bgt-lb-next', title: 'Next', onClick: (e) => { e.stopPropagation(); navLightbox(1); } }, '›');
         const close = el('button', { class: 'bgt-iconbtn bgt-lb-close', title: 'Close (Esc)', onClick: closeLightbox }, '✕');
+        // Settings gear, just left of the close button, so the panel is reachable without
+        // leaving the lightbox (mirrors the gear in the nav button and the in-line header).
+        const gear = el('button', {
+            class: 'bgt-iconbtn bgt-lb-gear', title: 'Gallery settings',
+            onClick: (e) => { e.stopPropagation(); openSettings(); },
+        }, svgIcon(ICON_GEAR, 20, 20));
         // Top-corner identity + follow, held well left of the close button (~150px) so a
         // mis-aimed close never lands on Follow. The button shares the header's profile
         // state, so following here updates both at once.
@@ -1099,7 +1105,7 @@
                 const t = e.target;
                 if (t === lbEl || (t.classList && t.classList.contains('bgt-lb-stage'))) closeLightbox();
             },
-        }, close, lbTop, lbThumbs, lbPrev, el('div', { class: 'bgt-lb-stage' }, lbImg, lbVideo, lbLoading), lbNext, bar);
+        }, close, gear, lbTop, lbThumbs, lbPrev, el('div', { class: 'bgt-lb-stage' }, lbImg, lbVideo, lbLoading), lbNext, bar);
         document.body.appendChild(lbEl);
         // Seed the freshly built top-corner controls from the current profile state.
         updateHeaderIdentity();
@@ -1115,6 +1121,11 @@
         // stopImmediatePropagation + window-capture so we win over Bluesky's own
         // arrow-key shortcuts (which listen on document and would otherwise eat them).
         lbKeyHandler = (e) => {
+            // When the settings panel is open over the lightbox, let it own the keyboard.
+            // This window-capture handler fires before the panel's own Esc handler (on
+            // document), so without bowing out here, Esc would close the lightbox instead
+            // of the panel. Returning (without stopping propagation) lets Esc reach it.
+            if (document.getElementById(SETTINGS_ID)) return;
             if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); closeLightbox(); }
             else if (e.key === 'ArrowLeft') { e.preventDefault(); e.stopImmediatePropagation(); navLightbox(-1); }
             else if (e.key === 'ArrowRight') { e.preventDefault(); e.stopImmediatePropagation(); navLightbox(1); }
@@ -2095,6 +2106,7 @@
             aspect-ratio: var(--bgt-ar, 16 / 9);
         }
         #${LIGHTBOX_ID} .bgt-lb-close { position: absolute; top: 16px; right: 20px; z-index: 4; }
+        #${LIGHTBOX_ID} .bgt-lb-gear { position: absolute; top: 16px; right: 60px; z-index: 4; }
         /* Identity + follow cluster, top-right but held ~150px clear of the close button. */
         #${LIGHTBOX_ID} .bgt-lb-top {
             position: absolute; top: 16px; right: 150px; z-index: 4;
