@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bluesky Gallery Toggle
 // @description  Replaces a profile's Media view with an x.com-style media grid (images + video), fed live by the AT Protocol API with infinite scroll. Full-screen or in-line.
-// @author       @quentinwolf.ca
+// @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
 // @version      2.8.7

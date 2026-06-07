@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BlueSky (View Original Images)
 // @description  Load the original images anywhere that thumbnails are loaded.
-// @author       QuentinWolf
+// @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_view_original_images
 // @version      0.32
