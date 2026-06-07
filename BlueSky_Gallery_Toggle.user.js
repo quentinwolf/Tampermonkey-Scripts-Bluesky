@@ -1089,8 +1089,17 @@
         lbLoadingText = el('div', { class: 'bgt-lb-loading-text' }, 'Loading media…');
         lbLoading = el('div', { class: 'bgt-lb-loading' }, lbLoadingSpin, lbLoadingText);
 
-        lbEl = el('div', { id: LIGHTBOX_ID, onClick: (e) => { if (e.target === lbEl) closeLightbox(); } },
-            close, lbTop, lbThumbs, lbPrev, el('div', { class: 'bgt-lb-stage' }, lbImg, lbVideo, lbLoading), lbNext, bar);
+        // Close on a click that lands on the backdrop OR the stage's empty letterbox
+        // area (there e.target is the stage div itself). The image/video are child
+        // elements, so a click on them targets the media - never the stage - which keeps
+        // click-drag-to-save the image intact. (The loader is pointer-events:none.)
+        lbEl = el('div', {
+            id: LIGHTBOX_ID,
+            onClick: (e) => {
+                const t = e.target;
+                if (t === lbEl || (t.classList && t.classList.contains('bgt-lb-stage'))) closeLightbox();
+            },
+        }, close, lbTop, lbThumbs, lbPrev, el('div', { class: 'bgt-lb-stage' }, lbImg, lbVideo, lbLoading), lbNext, bar);
         document.body.appendChild(lbEl);
         // Seed the freshly built top-corner controls from the current profile state.
         updateHeaderIdentity();
