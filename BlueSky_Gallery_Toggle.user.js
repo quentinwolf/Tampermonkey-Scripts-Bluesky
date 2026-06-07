@@ -4,7 +4,7 @@
 // @author       @quentinwolf.ca
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.8.6
+// @version      2.8.7
 // @license      GPL-3.0-or-later
 // @match        *://bsky.app/*
 // @run-at       document-start
@@ -89,6 +89,11 @@
     // The page-realm fetch, captured before we patch it. We use this for our own
     // API calls so they don't recurse through our capture hook.
     const nativeFetch = unsafeWindow.fetch;
+
+    // The native History.replaceState, captured before hookHistory() wraps it, so the
+    // lightbox can mirror the open post into the address bar without re-entering our own
+    // route handler (which would otherwise treat the /post/ URL as leaving the gallery).
+    const nativeReplaceState = unsafeWindow.history.replaceState;
 
     /* ======================================================================
      * 1. Borrow the logged-in session straight off the app's own requests.
@@ -982,6 +987,9 @@
     let thumbsRange = null; // [lo,hi] of items currently rendered in the thumbnail strip
     let lbLastDir = 1;            // last lightbox nav direction (+1 next / -1 prev), to bias prefetch
     const lbPrefetch = new Map(); // url -> Image: bounded buffer of warmed upcoming full-size images
+    let lbReturnUrl = null;  // address-bar URL to restore when the lightbox closes
+    let lbAppliedUrl = null; // the post URL we last wrote to the bar (detects a real navigation)
+    let lbUrlTimer = null;   // debounce so fast paging doesn't spam history.replaceState
 
     // Build one action button. `withCount` adds a live counter; like/bookmark pass a
     // second path so the icon can swap to its filled variant when active.
@@ -1185,6 +1193,7 @@
             if (lbImg.complete && lbImg.naturalWidth > 0) { lbImg.classList.add('bgt-loaded'); hideLbLoading(); }
         }
         lbLink.href = it.url;
+        lbSyncUrlSoon(it.url); // mirror this post into the address bar (debounced)
         updateNavButtons();
         updateActionBar();
         applyPostInfo();
@@ -1454,8 +1463,31 @@
         if (back >= lo && back <= hi) prefetchItem(grid.items[back]);
     }
 
+    // Write `url` to the address bar via the native replaceState (no reload, doesn't trip
+    // Bluesky's router) and re-baseline the route-poller so our own edit isn't read as the
+    // user leaving the gallery - a /post/ URL is not a gallery route and would close the grid.
+    function lbSetUrl(url) {
+        try {
+            nativeReplaceState.call(unsafeWindow.history, unsafeWindow.history.state, '', url);
+            lastSig = routeSig();
+        } catch (_) { /* blocked / cross-origin: just leave the bar as-is */ }
+    }
+
+    // Debounced address-bar sync for navigation: rapid wheel/arrow paging only writes the
+    // URL once you settle on an image, which also stays clear of browsers' replaceState
+    // rate limits (Safari throws past ~100 calls / 30s).
+    function lbSyncUrlSoon(url) {
+        if (lbUrlTimer) clearTimeout(lbUrlTimer);
+        lbUrlTimer = setTimeout(() => {
+            lbUrlTimer = null;
+            lbSetUrl(url);
+            lbAppliedUrl = location.href;
+        }, 200);
+    }
+
     function openLightbox(i) {
         if (!lbEl) buildLightbox();
+        lbReturnUrl = location.href; // remember the gallery URL to restore on close
         lbLastDir = 1; // fresh open: bias the buffer forward
         lbIndex = i;
         showLightbox();
@@ -1572,6 +1604,11 @@
         lbImg.src = '';
         lbPrefetch.clear(); // release the buffer's Image refs; the HTTP cache still holds the bytes
         unsafeWindow.removeEventListener('keydown', lbKeyHandler, true);
+        // Put the gallery's own URL back - but only if the bar still holds the post URL we
+        // set; if the user navigated/hit back, leave that alone. Cancel any pending sync first.
+        if (lbUrlTimer) { clearTimeout(lbUrlTimer); lbUrlTimer = null; }
+        if (lbReturnUrl != null && location.href === lbAppliedUrl) lbSetUrl(lbReturnUrl);
+        lbReturnUrl = lbAppliedUrl = null;
     }
 
     /* ======================================================================
