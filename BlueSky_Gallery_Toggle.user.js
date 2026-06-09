@@ -4,7 +4,7 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.8.7
+// @version      2.8.8
 // @license      GPL-3.0-or-later
 // @match        *://bsky.app/*
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js
@@ -37,6 +37,11 @@
     const WHEELACTION_KEY = 'bsky-gallery-wheelact'; // 'navigate' | 'zoom' | 'none' over the image
     const WHEELREV_KEY = 'bsky-gallery-wheelrev';    // boolean: invert wheel direction
     const BITRATE_KEY = 'bsky-gallery-bitrate';      // number: video start-quality guess, Mbps (1-25)
+    const TOOLTIP_KEY = 'bsky-gallery-tooltip';      // boolean: master switch for grid hover tooltip
+    const TTDATE_KEY = 'bsky-gallery-tt-date';       // boolean: post date line in tooltip
+    const TTLIKES_KEY = 'bsky-gallery-tt-likes';     // boolean: like count line in tooltip
+    const TTREPOSTS_KEY = 'bsky-gallery-tt-reposts'; // boolean: repost count line in tooltip
+    const TTREPLIES_KEY = 'bsky-gallery-tt-replies'; // boolean: reply count line in tooltip
     const PAGE_LIMIT = 100;                          // max getAuthorFeed page size
     const PUBLIC_API = 'https://public.api.bsky.app'; // unauthenticated fallback
     const ACCENT = '#4aa8ff';
@@ -79,6 +84,14 @@
         wheelAction: GM_getValue(WHEELACTION_KEY, 'navigate'),
         wheelReverse: GM_getValue(WHEELREV_KEY, false),
         bitrate: GM_getValue(BITRATE_KEY, 5),
+        // Grid hover tooltip: master switch + per-line toggles. Date defaults on (the
+        // "is this account still active?" cue that prompted the feature); the count
+        // lines start off so an enabled tooltip is a single tidy line by default.
+        tooltip: GM_getValue(TOOLTIP_KEY, false),
+        ttDate: GM_getValue(TTDATE_KEY, true),
+        ttLikes: GM_getValue(TTLIKES_KEY, false),
+        ttReposts: GM_getValue(TTREPOSTS_KEY, false),
+        ttReplies: GM_getValue(TTREPLIES_KEY, false),
     };
 
     // Gated console logging - toggle via the settings modal (Debug logging).
@@ -578,6 +591,18 @@
             const badge = el('span', { class: 'bgt-badge' }, svgIcon(ICON_PLAY, 12, 12), t.label || 'Video');
             tile.appendChild(badge);
         }
+
+        // Hover tooltip (post date / counts). Settings are read at hover-time so the
+        // toggles take effect without rebuilding the grid; mousemove only repositions
+        // while a tooltip is actually showing, so it's free when the feature is off.
+        tile.addEventListener('mouseenter', (e) => {
+            const lines = tooltipLinesFor(t.postState);
+            if (lines.length) showTooltip(lines, e.clientX, e.clientY);
+        });
+        tile.addEventListener('mousemove', (e) => {
+            if (ttEl && ttEl.style.display !== 'none') positionTooltip(e.clientX, e.clientY);
+        });
+        tile.addEventListener('mouseleave', hideTooltip);
         return tile;
     }
 
@@ -749,6 +774,69 @@
         const date = d.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
         return time + ' · ' + date;
     }
+
+    // Coarse "x days/months ago" for the hover tooltip - the quick "is this account
+    // still active?" read that prompted the feature. Floors each unit so 1.9 days
+    // reads "1 day ago", not "2".
+    function fmtRelative(iso) {
+        if (!iso) return '';
+        const d = new Date(iso);
+        if (isNaN(d.getTime())) return '';
+        let s = Math.floor((Date.now() - d.getTime()) / 1000);
+        if (s < 0) s = 0;
+        if (s < 45) return 'just now';
+        const units = [['year', 31536000], ['month', 2592000], ['day', 86400], ['hour', 3600], ['minute', 60]];
+        for (const [name, secs] of units) {
+            const v = Math.floor(s / secs);
+            if (v >= 1) return v + ' ' + name + (v === 1 ? '' : 's') + ' ago';
+        }
+        return 'just now';
+    }
+
+    /* ----------------------------------------------------------------------
+     * Grid hover tooltip. One shared, body-level node (never one per tile) that
+     * makeTile's hover handlers fill from the tile's postState and follow with the
+     * cursor. Lines are opt-in via the settings panel; with none enabled (or a tile
+     * that carries no postState, e.g. a GIF embed) we simply show nothing.
+     * -------------------------------------------------------------------- */
+    let ttEl = null;
+
+    function tooltipLinesFor(ps) {
+        if (!settings.tooltip || !ps) return [];
+        const lines = [];
+        if (settings.ttDate && ps.createdAt) {
+            const rel = fmtRelative(ps.createdAt);
+            lines.push('Posted ' + fmtPostTime(ps.createdAt) + (rel ? '  (' + rel + ')' : ''));
+        }
+        if (settings.ttLikes) lines.push('Likes: ' + (ps.likeCount || 0).toLocaleString());
+        if (settings.ttReposts) lines.push('Reposts: ' + (ps.repostCount || 0).toLocaleString());
+        if (settings.ttReplies) lines.push('Replies: ' + (ps.replyCount || 0).toLocaleString());
+        return lines;
+    }
+
+    function positionTooltip(x, y) {
+        if (!ttEl) return;
+        const pad = 14, margin = 6;
+        const r = ttEl.getBoundingClientRect();
+        const vw = window.innerWidth, vh = window.innerHeight;
+        let left = x + pad, top = y + pad;
+        if (left + r.width + margin > vw) left = x - r.width - pad; // flip to the cursor's left edge
+        if (left < margin) left = margin;
+        if (top + r.height + margin > vh) top = y - r.height - pad; // flip above the cursor
+        if (top < margin) top = margin;
+        ttEl.style.left = left + 'px';
+        ttEl.style.top = top + 'px';
+    }
+
+    function showTooltip(lines, x, y) {
+        if (!ttEl) { ttEl = el('div', { id: 'bgt-tooltip' }); document.body.appendChild(ttEl); }
+        while (ttEl.firstChild) ttEl.removeChild(ttEl.firstChild);
+        lines.forEach(line => ttEl.appendChild(el('div', { class: 'bgt-tt-line' }, line)));
+        ttEl.style.display = 'block';
+        positionTooltip(x, y);
+    }
+
+    function hideTooltip() { if (ttEl) ttEl.style.display = 'none'; }
 
     // Appended to a failure log when the borrowed session has gone stale, so the
     // console says what to do rather than just dumping an opaque error.
@@ -1742,6 +1830,7 @@
 
     function removeOverlay() {
         stopWaiting();
+        hideTooltip();
         if (inlineResizeHandler) { window.removeEventListener('resize', inlineResizeHandler); inlineResizeHandler = null; }
         if (inlineScrollHandler) { window.removeEventListener('scroll', inlineScrollHandler, true); inlineScrollHandler = null; }
         pendingHeader = null;
@@ -1884,6 +1973,18 @@
         return n;
     }
 
+    function setTooltip(on) {
+        settings.tooltip = !!on;
+        GM_setValue(TOOLTIP_KEY, settings.tooltip);
+        if (!settings.tooltip) hideTooltip(); // drop any tooltip that's up the moment it's disabled
+    }
+
+    // The per-line toggles share one setter (prop = settings field, key = storage key).
+    function setTooltipOpt(prop, key, on) {
+        settings[prop] = !!on;
+        GM_setValue(key, settings[prop]);
+    }
+
     function openSettings() {
         if (document.getElementById(SETTINGS_ID)) return;
         // Declared up front so its onChange can snap the box to the clamped value.
@@ -1903,6 +2004,24 @@
                 el('input', { type: 'checkbox', checked: settings.wheelReverse, onChange: (e) => setWheelReverse(e.target.checked) }),
                 el('span', {}, 'Reverse wheel direction')),
             el('div', { class: 'bgt-settings-hint' }, 'Scroll the thumbnail strip to flip within a post; over the image the wheel does the action chosen above.'));
+        // Tooltip sub-options, revealed in place by the master checkbox below (same
+        // pattern as the wheel block). Each ticked line shows on its own row in the
+        // hover tooltip.
+        const tooltipSub = el('div', { class: 'bgt-wheel-sub', style: { display: settings.tooltip ? 'block' : 'none' } },
+            el('div', { class: 'bgt-settings-label' }, 'Show in tooltip'),
+            el('label', { class: 'bgt-check-row' },
+                el('input', { type: 'checkbox', checked: settings.ttDate, onChange: (e) => setTooltipOpt('ttDate', TTDATE_KEY, e.target.checked) }),
+                el('span', {}, 'Post date')),
+            el('label', { class: 'bgt-check-row' },
+                el('input', { type: 'checkbox', checked: settings.ttLikes, onChange: (e) => setTooltipOpt('ttLikes', TTLIKES_KEY, e.target.checked) }),
+                el('span', {}, 'Like count')),
+            el('label', { class: 'bgt-check-row' },
+                el('input', { type: 'checkbox', checked: settings.ttReposts, onChange: (e) => setTooltipOpt('ttReposts', TTREPOSTS_KEY, e.target.checked) }),
+                el('span', {}, 'Repost count')),
+            el('label', { class: 'bgt-check-row' },
+                el('input', { type: 'checkbox', checked: settings.ttReplies, onChange: (e) => setTooltipOpt('ttReplies', TTREPLIES_KEY, e.target.checked) }),
+                el('span', {}, 'Reply count')),
+            el('div', { class: 'bgt-settings-hint' }, 'Each ticked item shows on its own line when you hover a thumbnail in the grid.'));
         const card = el('div', { class: 'bgt-settings-card' },
             el('h2', {}, 'Gallery settings'),
             el('div', { class: 'bgt-settings-sub' }, 'How should the media grid appear?'),
@@ -1914,6 +2033,10 @@
                 sizeChip('medium', 'Medium'),
                 sizeChip('large', 'Large')),
             el('div', { class: 'bgt-settings-hint' }, 'In-line columns: 5 · 4 · 3'),
+            el('label', { class: 'bgt-check-row' },
+                el('input', { type: 'checkbox', checked: settings.tooltip, onChange: (e) => { setTooltip(e.target.checked); tooltipSub.style.display = e.target.checked ? 'block' : 'none'; } }),
+                el('span', {}, 'Enable gallery tooltip hover')),
+            tooltipSub,
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.postInfo, onChange: (e) => setPostInfo(e.target.checked) }),
                 el('span', {}, 'Show post text in the lightbox')),
@@ -2098,6 +2221,15 @@
             border-radius: 50%; animation: bgtspin .8s linear infinite;
         }
         @keyframes bgtspin { to { transform: rotate(360deg); } }
+
+        /* ---- grid hover tooltip (one shared body-level node) ---- */
+        #bgt-tooltip {
+            position: fixed; z-index: 100000; display: none; pointer-events: none;
+            max-width: 320px; padding: 6px 9px; border-radius: 8px;
+            background: rgba(20,27,34,0.97); color: #e6e9ec; border: 1px solid rgba(127,127,127,0.3);
+            box-shadow: 0 4px 14px rgba(0,0,0,0.5); font-size: 12px; line-height: 1.5;
+        }
+        #bgt-tooltip .bgt-tt-line { white-space: nowrap; }
 
         /* ---- in-line mode: flow in the page, inherit the page theme ---- */
         #${OVERLAY_ID}.bgt-inline {
