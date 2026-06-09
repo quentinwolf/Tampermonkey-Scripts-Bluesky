@@ -4,7 +4,7 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.8.8
+// @version      2.9.1
 // @license      GPL-3.0-or-later
 // @match        *://bsky.app/*
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js
@@ -42,6 +42,7 @@
     const TTLIKES_KEY = 'bsky-gallery-tt-likes';     // boolean: like count line in tooltip
     const TTREPOSTS_KEY = 'bsky-gallery-tt-reposts'; // boolean: repost count line in tooltip
     const TTREPLIES_KEY = 'bsky-gallery-tt-replies'; // boolean: reply count line in tooltip
+    const TABHASH_KEY = 'bsky-gallery-tabhash';      // boolean: mirror profile tab <-> URL #hash
     const PAGE_LIMIT = 100;                          // max getAuthorFeed page size
     const PUBLIC_API = 'https://public.api.bsky.app'; // unauthenticated fallback
     const ACCENT = '#4aa8ff';
@@ -92,6 +93,7 @@
         ttLikes: GM_getValue(TTLIKES_KEY, false),
         ttReposts: GM_getValue(TTREPOSTS_KEY, false),
         ttReplies: GM_getValue(TTREPLIES_KEY, false),
+        tabHash: GM_getValue(TABHASH_KEY, true),
     };
 
     // Gated console logging - toggle via the settings modal (Debug logging).
@@ -107,6 +109,13 @@
     // lightbox can mirror the open post into the address bar without re-entering our own
     // route handler (which would otherwise treat the /post/ URL as leaving the gallery).
     const nativeReplaceState = unsafeWindow.history.replaceState;
+
+    // The URL hash present at first load, captured here at document-start - before any
+    // page script runs - because Bluesky's router normalises /profile/<h>#media back to
+    // /profile/<h> during hydration, so a later read would already be empty. Consumed
+    // once by the tab-sync as the initial deep-link target.
+    const bootHash = (location.hash || '').replace(/^#/, '').toLowerCase();
+    let bootHashUsed = false;
 
     /* ======================================================================
      * 1. Borrow the logged-in session straight off the app's own requests.
@@ -1734,6 +1743,151 @@
         return { actor: decodeURIComponent(m[1]), tab: tab };
     }
 
+    /* ======================================================================
+     * 6b. Profile tab <-> URL hash deep-linking.
+     *
+     *   Bluesky's profile tabs (Posts/Replies/Media/Videos/Likes/...) are pure
+     *   client-side state - the path never changes as you switch them. This mirrors
+     *   the active tab into the address bar as a #hash and, conversely, honours a
+     *   #hash on load (or typed / back-forward) by clicking through to that tab, so
+     *   a link like /profile/<handle>#media lands straight on Media. Tab names are
+     *   read live from the pager, so whatever tabs a profile exposes are supported.
+     *   Independent of the gallery overlay; gated by the "Sync profile tab to URL
+     *   hash" setting.
+     * ==================================================================== */
+    const TAB_HASH_ALIAS = { video: 'videos', with_replies: 'replies' }; // accept the path-style spellings too
+
+    function profileTabButtons() {
+        return Array.from(document.querySelectorAll(
+            '[data-testid^="profilePager-"]:not([data-testid^="profilePager-selector"])'));
+    }
+    function tabNameOf(btn) {
+        return (btn.getAttribute('data-testid') || '').replace('profilePager-', '').toLowerCase();
+    }
+    // The leftmost pager tab is Bluesky's default (Posts) - the one shown with no hash.
+    function defaultTabName() {
+        const btns = profileTabButtons();
+        return btns.length ? tabNameOf(btns[0]) : 'posts';
+    }
+    function tabFromHash() {
+        const h = (location.hash || '').replace(/^#/, '').toLowerCase();
+        if (!h) return '';
+        return TAB_HASH_ALIAS[h] || h;
+    }
+    // The interactive tab-bar controls that actually switch tabs when clicked. The
+    // profilePager-* nodes are great for *reading* the active tab (activeProfileTab),
+    // but clicking them does nothing - the real controls are the [role="tab"] buttons
+    // in the tablist. We gather both: role=tab buttons (preferred, clickable, matched
+    // by their accessible label) and the profilePager-* nodes (fallback, e.g. if the
+    // label is localised but the testid stays English).
+    function profileTabCandidates() {
+        const out = [];
+        const tablist = document.querySelector('[role="tablist"]');
+        if (tablist) {
+            tablist.querySelectorAll('[role="tab"]').forEach(t => {
+                const name = (t.getAttribute('aria-label') || t.textContent || '').trim().toLowerCase();
+                if (name) out.push({ el: t, name });
+            });
+        }
+        document.querySelectorAll('[data-testid^="profilePager-"]:not([data-testid^="profilePager-selector"])').forEach(p => {
+            const name = (p.getAttribute('data-testid') || '').replace('profilePager-', '').toLowerCase();
+            if (name) out.push({ el: p, name });
+        });
+        return out;
+    }
+
+    // React-native-web Pressables don't reliably fire onPress from a bare .click(), so
+    // we play a full pointer+mouse sequence (which React's delegated listeners pick up)
+    // and finish with the native click for good measure.
+    function fireClick(elx) {
+        const o = { bubbles: true, cancelable: true, view: unsafeWindow };
+        const P = unsafeWindow.PointerEvent, M = unsafeWindow.MouseEvent;
+        try { if (P) elx.dispatchEvent(new P('pointerdown', o)); } catch (_) { /* ignore */ }
+        try { elx.dispatchEvent(new M('mousedown', o)); } catch (_) { /* ignore */ }
+        try { if (P) elx.dispatchEvent(new P('pointerup', o)); } catch (_) { /* ignore */ }
+        try { elx.dispatchEvent(new M('mouseup', o)); } catch (_) { /* ignore */ }
+        try { elx.dispatchEvent(new M('click', o)); } catch (_) { /* ignore */ }
+        try { elx.click(); } catch (_) { /* ignore */ }
+    }
+
+    function clickProfileTab(name) {
+        if (activeProfileTab() === name) return true;
+        const cands = profileTabCandidates().filter(c => c.name === name);
+        if (!cands.length) return false;
+        fireClick(cands[0].el); // role=tab candidates sort first - the genuine control
+        logDebug('tab-hash: click "' + name + '" via ' +
+            (cands[0].el.getAttribute('role') || cands[0].el.getAttribute('data-testid') || '?'));
+        return true;
+    }
+    // Write (or clear) the hash without re-entering our own history wrapper or firing
+    // hashchange - nativeReplaceState does neither, so this can't loop back into us.
+    function setTabHash(name) {
+        const want = name ? '#' + name : '';
+        if ((location.hash || '') === want) return;
+        const url = location.pathname + location.search + want;
+        try { nativeReplaceState.call(unsafeWindow.history, unsafeWindow.history.state, '', url); }
+        catch (_) { /* ignore */ }
+    }
+
+    // pendingHash = a deep-link target we're still trying to click through to; actor
+    // tracks the profile we're managing so a fresh hash is re-read on each new profile.
+    const tabSync = { actor: null, pendingHash: null, deadline: 0 };
+
+    function tickTabSync() {
+        if (!settings.tabHash) return;
+        const r = currentProfileRoute();
+        if (!r) { tabSync.actor = null; tabSync.pendingHash = null; return; }
+
+        // Entering a profile: take the hash as a deep-link target. On the page's very
+        // first profile we fall back to bootHash (captured at document-start), since a
+        // cold load of /profile/<h>#media has its hash stripped by Bluesky's router
+        // before we get here - a live read would already be empty.
+        if (tabSync.actor !== r.actor) {
+            tabSync.actor = r.actor;
+            let want = tabFromHash();
+            if (!want && !bootHashUsed) want = TAB_HASH_ALIAS[bootHash] || bootHash;
+            bootHashUsed = true;
+            tabSync.pendingHash = want || null;
+            tabSync.deadline = Date.now() + 12000; // cold loads need longer for the pager to paint
+        }
+
+        const active = activeProfileTab();
+
+        // Phase 1 - drive the pager to a pending deep-link target.
+        if (tabSync.pendingHash) {
+            const cands = profileTabCandidates();
+            // Tab bar not painted yet: wait (only abandon once the deadline lapses), so a
+            // cold load can't strip the hash before the controls even exist.
+            if (!cands.length) { if (Date.now() > tabSync.deadline) tabSync.pendingHash = null; return; }
+            if (active === tabSync.pendingHash) tabSync.pendingHash = null;                  // arrived
+            else if (!cands.some(c => c.name === tabSync.pendingHash)) tabSync.pendingHash = null; // genuinely no such tab
+            else if (Date.now() > tabSync.deadline) tabSync.pendingHash = null;              // gave up
+            else clickProfileTab(tabSync.pendingHash);
+            return; // don't mirror back while we're still applying
+        }
+
+        // Phase 2 - mirror the active tab into the hash (default tab => clean URL).
+        if (active) setTabHash(active === defaultTabName() ? '' : active);
+    }
+
+    // A typed hash, an in-page #anchor, or back/forward landing on a hash: queue it as
+    // a target. (Our own setTabHash uses replaceState, which never fires hashchange, so
+    // this only ever sees genuinely external hash changes - no feedback loop.)
+    function onTabHashChange() {
+        if (!settings.tabHash) return;
+        const h = tabFromHash();
+        if (!h || h === activeProfileTab()) return;
+        tabSync.pendingHash = h;
+        tabSync.deadline = Date.now() + 12000;
+        tickTabSync();
+    }
+
+    function setTabHashSync(on) {
+        settings.tabHash = !!on;
+        GM_setValue(TABHASH_KEY, settings.tabHash);
+        if (settings.tabHash) tickTabSync(); // begin mirroring straight away
+    }
+
     let pendingHeader = null, waitingActor = null, waitingVideos = false, mountObserver = null, mountTimer = null;
 
     // The profile feed has to be painted before we can find the in-line anchor.
@@ -2056,6 +2210,10 @@
                 bitrateInput,
                 el('span', { class: 'bgt-bitrate-unit' }, 'Mbps')),
             el('div', { class: 'bgt-settings-hint' }, 'Bandwidth hls.js assumes for the first video segment (1–25). Higher loads sharper sooner; lower it if you ever see stalls.'),
+            el('label', { class: 'bgt-check-row' },
+                el('input', { type: 'checkbox', checked: settings.tabHash, onChange: (e) => setTabHashSync(e.target.checked) }),
+                el('span', {}, 'Sync profile tab to URL hash')),
+            el('div', { class: 'bgt-settings-hint' }, 'Reflects the open profile tab in the address bar (e.g. #media) and opens that tab when a link includes the hash — so other tools can deep-link straight to Media, Videos, Replies, etc.'),
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.debug, onChange: (e) => setDebug(e.target.checked) }),
                 el('span', {}, 'Debug logging to console')),
@@ -2436,6 +2594,7 @@
         return location.href + '|' + (r ? r.tab : '-');
     }
     function onRouteChange() {
+        tickTabSync(); // apply a deep-link hash / mirror the active tab before we settle
         lastSig = routeSig();
         logDebug('route/tab change -> ' + lastSig);
         ensureButton();
@@ -2457,13 +2616,20 @@
         new MutationObserver(updateButtonState)
             .observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
 
+        // Honour a typed hash / back-forward landing on one, and let the gallery's own
+        // history wrapper coexist with our hash mirroring.
+        unsafeWindow.addEventListener('hashchange', onTabHashChange);
+
         // Watches for navigation AND profile tab switches. The Media/Videos pager
         // doesn't change the URL, so href alone isn't enough - routeSig() also folds
-        // in the active-tab state.
+        // in the active-tab state. tickTabSync runs every tick too (not just on change)
+        // so a pending deep-link keeps retrying until the pager paints.
         setInterval(() => {
             if (routeSig() !== lastSig) onRouteChange();
+            tickTabSync();
         }, 500);
 
+        tickTabSync(); // apply any hash present on first paint
         syncGallery();
     }
 
