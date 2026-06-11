@@ -4,13 +4,16 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.9.1
+// @version      2.10.0
 // @license      GPL-3.0-or-later
+// @homepageURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky
+// @supportURL   https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/issues
 // @match        *://bsky.app/*
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js
 // @downloadURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
 // @updateURL    https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
 // @run-at       document-start
+// @noframes
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        unsafeWindow
@@ -182,6 +185,11 @@
     // Called by captureAuth whenever the app hands us a different token.
     function notifyTokenRefreshed() {
         auth.stale = false;
+        // If the open gallery's profile was read before a token existed (public
+        // fallback - no viewer block), re-read it now: otherwise the follow button
+        // could offer "+ Follow" for an already-followed account, and a click would
+        // write a duplicate follow record.
+        if (grid.actor && !profile.viewerKnown && !profile._busyFollow) loadProfile(grid.actor);
         if (!freshTokenWaiters.length) return;
         const ws = freshTokenWaiters; freshTokenWaiters = [];
         ws.forEach(fn => { try { fn(true); } catch (_) { /* ignore */ } });
@@ -389,6 +397,8 @@
      * ==================================================================== */
     const grid = {
         actor: null, videosOnly: false, cursor: undefined, loading: false, done: false,
+        failed: false, // last page failed: pause infinite scroll until the Retry button clears it
+        gen: 0,        // bumped per openGallery; in-flight loads check it before touching state
         items: [], seen: null, // lightbox-viewable items (images + native videos), in grid order
     };
     let rootEl, scrollEl, gridEl, sentinelEl, countEl, io, overlayKeyHandler;
@@ -397,7 +407,9 @@
     // Viewed profile's identity + follow state, populated by loadProfile() from
     // app.bsky.actor.getProfile. followUri is the viewer's follow-record URI (the
     // handle for unfollow) or null; isMe suppresses the button on your own profile.
-    const profile = { actor: null, did: null, handle: null, displayName: '', followUri: null, isMe: false, _busyFollow: false };
+    // viewerKnown: follow state came from an authed read (the public fallback can't
+    // see follows), so the follow button is only offered once it's true.
+    const profile = { actor: null, did: null, handle: null, displayName: '', followUri: null, isMe: false, viewerKnown: false, _busyFollow: false };
     // Our last local follow/unfollow, kept across remounts so a not-yet-indexed
     // AppView read can't bounce the button back. uri = follow-record URI, or null
     // when we just unfollowed. Trusted over the AppView for FOLLOW_TRUST_MS.
@@ -576,6 +588,16 @@
         while (sentinelEl.firstChild) sentinelEl.removeChild(sentinelEl.firstChild);
         if (mode === 'spin') sentinelEl.appendChild(el('div', { class: 'bgt-spinner' }));
         else if (mode === 'text') sentinelEl.appendChild(document.createTextNode(text || ''));
+        else if (mode === 'retry') {
+            // A failed page pauses infinite scroll (grid.failed) rather than ending it
+            // for good; the button clears the flag and asks again.
+            sentinelEl.appendChild(el('div', { class: 'bgt-retry' },
+                el('span', {}, text || 'Could not load media'),
+                el('button', {
+                    class: 'bgt-retry-btn', type: 'button',
+                    onClick: () => { grid.failed = false; loadMore(); },
+                }, 'Retry')));
+        }
     }
 
     function makeTile(t) {
@@ -633,17 +655,22 @@
             frag.appendChild(makeTile(t));
         });
         gridEl.appendChild(frag);
-        if (countEl) countEl.textContent = '· ' + grid.seen.size + ' items';
+        if (countEl) countEl.textContent = '· ' + grid.seen.size + (grid.seen.size === 1 ? ' item' : ' items');
     }
 
     async function loadMore() {
-        if (grid.loading || grid.done || !grid.actor || !rootEl) return;
+        if (grid.loading || grid.done || grid.failed || !grid.actor || !rootEl) return;
+        const gen = grid.gen; // identifies this gallery; openGallery bumps it on a switch
         grid.loading = true;
         setSentinel('spin');
         try {
             const filter = grid.videosOnly ? 'posts_with_video' : 'posts_with_media';
             logDebug('loadMore filter=' + filter + ' cursor=' + (grid.cursor || '(first page)'));
             const data = await fetchMediaPage(grid.actor, grid.cursor, filter);
+            // The gallery may have switched profile/tab while this page was in flight;
+            // its cursor and tiles belong to the old view, so drop them (loadProfile
+            // guards the same way).
+            if (gen !== grid.gen) return;
             grid.cursor = data.cursor;
             if (!data.cursor) grid.done = true;
 
@@ -663,12 +690,15 @@
             if (grid.done) setSentinel('text', grid.seen.size ? 'End of ' + noun : 'No ' + noun + ' found');
             else setSentinel('none');
         } catch (e) {
+            if (gen !== grid.gen) return; // stale failure: a newer gallery owns the UI now
             console.error('[Gallery Toggle] load failed:', e);
-            grid.done = true;
-            setSentinel('text', 'Could not load media (' + (e && e.message ? e.message : 'error') + ')');
+            grid.failed = true; // pause infinite scroll; the sentinel's Retry resumes it
+            setSentinel('retry', 'Could not load media (' + (e && e.message ? e.message : 'error') + ')');
         } finally {
-            grid.loading = false;
-            if (!grid.done) requestAnimationFrame(maybeLoadMore); // keep filling short pages
+            if (gen === grid.gen) { // never clobber the switched-to gallery's state
+                grid.loading = false;
+                if (!grid.done && !grid.failed) requestAnimationFrame(maybeLoadMore); // keep filling short pages
+            }
         }
     }
 
@@ -736,13 +766,15 @@
         try { return text ? JSON.parse(text) : {}; } catch (_) { return {}; }
     }
 
-    // Atproto error shapes that mean "this token is no longer valid".
+    // Atproto error shapes that mean "this token is no longer valid". A 403 is a
+    // permissions refusal (e.g. a block), not token staleness - retrying it with a
+    // fresh token would just burn the 4s wait before surfacing the same error.
     function isAuthError(e) {
         if (!e) return false;
         const name = String(e.xrpcError || '').toLowerCase();
         if (name === 'expiredtoken' || name === 'invalidtoken' ||
             name === 'authmissing' || name === 'authenticationrequired') return true;
-        return e.status === 401 || e.status === 403;
+        return e.status === 401;
     }
 
     // A write with one-shot stale-token recovery: try once; on an auth error wait
@@ -770,7 +802,10 @@
         n = n || 0;
         if (n <= 0) return '';
         if (n < 1000) return String(n);
-        if (n < 1e6) { const v = n / 1e3; return (v >= 100 ? Math.round(v) : Math.round(v * 10) / 10) + 'K'; }
+        if (n < 1e6) {
+            const v = n / 1e3, r = v >= 100 ? Math.round(v) : Math.round(v * 10) / 10;
+            if (r < 1000) return r + 'K'; // 999,500+ would round to "1000K": promote to M below
+        }
         const v = n / 1e6; return (v >= 100 ? Math.round(v) : Math.round(v * 10) / 10) + 'M';
     }
 
@@ -941,6 +976,8 @@
      *     likes/reposts - the subject is the target DID, and the returned record URI
      *     is what we delete to unfollow.
      * ==================================================================== */
+    // Resolves to { data, authed } (or null): `authed` says which path served it, so
+    // loadProfile knows whether the viewer/follow state in `data` can be trusted.
     async function fetchProfile(actor) {
         const path = '/xrpc/app.bsky.actor.getProfile?actor=' + encodeURIComponent(actor);
         // Authed first so viewer.following comes back; fall back to the public AppView
@@ -948,36 +985,42 @@
         if (auth.origin && auth.headers) {
             try {
                 const res = await nativeFetch(auth.origin + path, { headers: auth.headers, credentials: 'omit' });
-                if (res.ok) return res.json();
+                if (res.ok) return { data: await res.json(), authed: true };
             } catch (e) { /* fall through to public */ }
         }
         try {
             const res = await nativeFetch(PUBLIC_API + path, { headers: { 'accept-language': navigator.language || 'en' } });
-            if (res.ok) return res.json();
+            if (res.ok) return { data: await res.json(), authed: false };
         } catch (e) { /* ignore */ }
         return null;
     }
 
     async function loadProfile(actor) {
-        let data;
-        try { data = await fetchProfile(actor); } catch (e) { data = null; }
-        if (!data || grid.actor !== actor) return; // gallery closed or switched while we waited
+        let r;
+        try { r = await fetchProfile(actor); } catch (e) { r = null; }
+        if (!r || !r.data || grid.actor !== actor) return; // gallery closed or switched while we waited
+        const data = r.data;
         profile.did = data.did || null;
         profile.handle = data.handle || null;
         profile.displayName = data.displayName || '';
-        // Follow state: only the authed AppView carries a viewer block; the public
-        // fallback can't see follows, so never let it null out a known follow. And
+        // Follow state: only an authed read carries a trustworthy viewer block; the
+        // public fallback can't see follows, so never let it null out a known follow
+        // (viewerKnown also gates the button - see updateFollowVisibility). And
         // within FOLLOW_TRUST_MS of a local write (or while one's in flight), trust
         // our own result over a possibly-lagging AppView read - covers both follow
         // and unfollow, and stops a stale read from re-triggering a duplicate write.
-        if (data.viewer && !profile._busyFollow) {
-            const recent = recentFollow.did && recentFollow.did === profile.did &&
-                           (Date.now() - recentFollow.at) < FOLLOW_TRUST_MS;
-            profile.followUri = recent ? recentFollow.uri : (data.viewer.following || null);
+        if (r.authed && data.viewer) {
+            profile.viewerKnown = true;
+            if (!profile._busyFollow) {
+                const recent = recentFollow.did && recentFollow.did === profile.did &&
+                               (Date.now() - recentFollow.at) < FOLLOW_TRUST_MS;
+                profile.followUri = recent ? recentFollow.uri : (data.viewer.following || null);
+            }
         }
         const me = getMyDid();
         profile.isMe = !!(me && profile.did && me === profile.did);
-        logDebug('profile loaded handle=' + profile.handle + ' following=' + !!profile.followUri + ' isMe=' + profile.isMe);
+        logDebug('profile loaded handle=' + profile.handle + ' following=' + !!profile.followUri +
+            ' isMe=' + profile.isMe + ' viewerKnown=' + profile.viewerKnown);
         updateHeaderIdentity();
         updateFollowButton();
         updateFollowVisibility();
@@ -1021,8 +1064,10 @@
     }
 
     function updateFollowVisibility() {
-        // Only meaningful with a writable session, a known DID, and not your own profile.
-        const eligible = !!getMyDid() && !!profile.did && !profile.isMe;
+        // Only meaningful with a writable session, a known DID, not your own profile,
+        // and follow state actually read (viewerKnown) - offering "+ Follow" blind
+        // could duplicate an existing follow record.
+        const eligible = !!getMyDid() && !!profile.did && !profile.isMe && profile.viewerKnown;
         if (followBtn) {
             // Full screen hides the bio entirely, so the button is always welcome there;
             // in-line shows it only once the bar nears the top (else it would duplicate
@@ -1087,6 +1132,7 @@
     let lbReturnUrl = null;  // address-bar URL to restore when the lightbox closes
     let lbAppliedUrl = null; // the post URL we last wrote to the bar (detects a real navigation)
     let lbUrlTimer = null;   // debounce so fast paging doesn't spam history.replaceState
+    let lbPrevFocus = null;  // element focused before the lightbox opened (restored on close)
 
     // Build one action button. `withCount` adds a live counter; like/bookmark pass a
     // second path so the icon can swap to its filled variant when active.
@@ -1206,6 +1252,9 @@
         // click-drag-to-save the image intact. (The loader is pointer-events:none.)
         lbEl = el('div', {
             id: LIGHTBOX_ID,
+            // Announced as a modal dialog; tabindex -1 lets openLightbox move focus
+            // into it so keyboard/screen-reader users land inside, not on the page.
+            role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Media viewer', tabindex: '-1',
             onClick: (e) => {
                 const t = e.target;
                 if (t === lbEl || (t.classList && t.classList.contains('bgt-lb-stage'))) closeLightbox();
@@ -1234,7 +1283,25 @@
             if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); closeLightbox(); }
             else if (e.key === 'ArrowLeft') { e.preventDefault(); e.stopImmediatePropagation(); navLightbox(-1); }
             else if (e.key === 'ArrowRight') { e.preventDefault(); e.stopImmediatePropagation(); navLightbox(1); }
+            else if (e.key === 'Tab') lbTrapTab(e);
         };
+    }
+
+    // Modal focus trap. Only the boundary crossings are redirected (wrap to the other
+    // end); Tab between controls inside the dialog is left to the browser. Without
+    // this, Tab walks out into the page hidden behind the lightbox.
+    function lbTrapTab(e) {
+        const f = Array.from(lbEl.querySelectorAll('button, a[href], video, [tabindex]:not([tabindex="-1"])'))
+            .filter(x => x.getBoundingClientRect().width > 0 && getComputedStyle(x).visibility !== 'hidden');
+        if (!f.length) { e.preventDefault(); return; }
+        const cur = document.activeElement;
+        const outside = !lbEl.contains(cur);
+        const atStart = outside || cur === f[0] || cur === lbEl; // from the container, Shift-Tab would walk out backwards
+        const atEnd = outside || cur === f[f.length - 1];
+        if (e.shiftKey ? atStart : atEnd) {
+            e.preventDefault(); e.stopImmediatePropagation();
+            (e.shiftKey ? f[f.length - 1] : f[0]).focus();
+        }
     }
 
     // Loading overlay: spinner + "Loading media…" while a navigated-to image decodes.
@@ -1468,9 +1535,11 @@
             const isUrl = /^(https?:\/\/|www\.)/i.test(m[0]);
             const isMention = m[0][0] === '@';
 
-            // Mentions / bare handles must sit on a real boundary, so we don't grab the
-            // domain of an e-mail (bob@alice.bsky.social) or a mid-word run.
-            if (!isUrl) {
+            // Mentions, bare handles and www. links must sit on a real boundary, so we
+            // don't grab the domain of an e-mail (bob@alice.bsky.social), a mid-word
+            // run, or the tail of "Awww.That" as www.That. (https?:// is exempt - a
+            // scheme can't legitimately start mid-word.)
+            if (!/^https?:\/\//i.test(m[0])) {
                 const prev = start > 0 ? text[start - 1] : '';
                 if (prev && /[a-z0-9@._\-]/i.test(prev)) { LINKIFY_RE.lastIndex = start + 1; continue; }
             }
@@ -1535,7 +1604,9 @@
         lbPrefetch.set(url, img);
         while (lbPrefetch.size > LB_PREFETCH_CACHE) { // evict oldest beyond the cap
             const oldest = lbPrefetch.keys().next().value;
+            const ev = lbPrefetch.get(oldest);
             lbPrefetch.delete(oldest);
+            if (ev && !ev.complete) ev.src = ''; // still downloading: abort, don't just orphan it
         }
     }
 
@@ -1585,10 +1656,12 @@
     function openLightbox(i) {
         if (!lbEl) buildLightbox();
         lbReturnUrl = location.href; // remember the gallery URL to restore on close
+        lbPrevFocus = document.activeElement; // hand focus back here on close
         lbLastDir = 1; // fresh open: bias the buffer forward
         lbIndex = i;
         showLightbox();
         lbEl.style.display = 'flex';
+        lbEl.focus({ preventScroll: true }); // move keyboard/AT focus into the dialog
         unsafeWindow.addEventListener('keydown', lbKeyHandler, true);
     }
 
@@ -1698,9 +1771,14 @@
         if (!lbEl) return;
         teardownVideo();
         lbEl.style.display = 'none';
+        lbImg.onload = lbImg.onerror = null; // detach first: clearing src fires `error`
         lbImg.src = '';
+        lbPrefetch.forEach(img => { if (!img.complete) img.src = ''; }); // abort in-flight warms
         lbPrefetch.clear(); // release the buffer's Image refs; the HTTP cache still holds the bytes
         unsafeWindow.removeEventListener('keydown', lbKeyHandler, true);
+        // Hand focus back to whatever had it before the dialog opened (e.g. the tile).
+        if (lbPrevFocus && lbPrevFocus.isConnected) { try { lbPrevFocus.focus(); } catch (_) { /* ignore */ } }
+        lbPrevFocus = null;
         // Put the gallery's own URL back - but only if the bar still holds the post URL we
         // set; if the user navigated/hit back, leave that alone. Cancel any pending sync first.
         if (lbUrlTimer) { clearTimeout(lbUrlTimer); lbUrlTimer = null; }
@@ -1905,17 +1983,20 @@
         removeOverlay();
 
         logDebug('openGallery actor=' + actor + ' videosOnly=' + videosOnly + ' mode=' + settings.mode);
+        grid.gen++; // strands any in-flight loadMore from the previous gallery
         grid.actor = actor;
         grid.videosOnly = videosOnly;
         grid.cursor = undefined;
         grid.done = false;
         grid.loading = false;
+        grid.failed = false;
         grid.items = [];
         grid.seen = new Set();
 
         // Reset per-profile identity/follow state; loadProfile() fills it in async.
         profile.actor = actor; profile.did = null; profile.handle = null;
-        profile.displayName = ''; profile.followUri = null; profile.isMe = false; profile._busyFollow = false;
+        profile.displayName = ''; profile.followUri = null; profile.isMe = false;
+        profile.viewerKnown = false; profile._busyFollow = false;
 
         gridEl = el('div', { class: 'bgt-grid' });
         sentinelEl = el('div', { class: 'bgt-sentinel' }, el('div', { class: 'bgt-spinner' }));
@@ -2236,9 +2317,18 @@
     /* ======================================================================
      * 8. Nav toggle button (kept where it was, after Settings) + gear.
      * ==================================================================== */
-    function navTextColor() {
+    // The nav's own Settings link: our insertion anchor and colour reference. Matched
+    // by href first - aria-labels are translated on non-English UIs, so the label
+    // comparison only works as a fallback.
+    function findSettingsLink() {
         const nav = document.querySelector('nav[role="navigation"]');
-        const ref = nav && Array.from(nav.querySelectorAll('a')).find(a => a.getAttribute('aria-label') === 'Settings');
+        if (!nav) return null;
+        return nav.querySelector('a[href="/settings"]') ||
+            Array.from(nav.querySelectorAll('a')).find(a => a.getAttribute('aria-label') === 'Settings') || null;
+    }
+
+    function navTextColor() {
+        const ref = findSettingsLink();
         return ref ? getComputedStyle(ref).color : 'rgb(241, 243, 245)';
     }
 
@@ -2251,9 +2341,7 @@
     }
 
     function createButton() {
-        const nav = document.querySelector('nav[role="navigation"]');
-        if (!nav) return;
-        const settingsLink = Array.from(nav.querySelectorAll('a')).find(a => a.getAttribute('aria-label') === 'Settings');
+        const settingsLink = findSettingsLink();
         if (!settingsLink) return;
 
         const icon = el('div', { class: 'bgt-btn-icon' }, svgIcon(ICON_GRID, 28, 28));
@@ -2380,6 +2468,14 @@
         }
         @keyframes bgtspin { to { transform: rotate(360deg); } }
 
+        /* ---- failed-page sentinel: message + Retry (resumes infinite scroll) ---- */
+        .bgt-retry { display: flex; align-items: center; gap: 12px; }
+        .bgt-retry-btn {
+            background: rgba(127,127,127,0.18); color: inherit; border: 1px solid rgba(127,127,127,0.4);
+            border-radius: 999px; padding: 6px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
+        }
+        .bgt-retry-btn:hover { background: rgba(127,127,127,0.32); }
+
         /* ---- grid hover tooltip (one shared body-level node) ---- */
         #bgt-tooltip {
             position: fixed; z-index: 100000; display: none; pointer-events: none;
@@ -2404,6 +2500,7 @@
         #${LIGHTBOX_ID} {
             position: fixed; inset: 0; z-index: 99999; background: rgba(0,0,0,0.93);
             display: none; align-items: center; justify-content: center;
+            outline: none; /* programmatic focus target (role=dialog) - no ring on the backdrop */
         }
         /* The stage is a fixed band the media scales/centres within: top/bottom set its
            edges (held clear of the top controls and the bottom action bar), and the
@@ -2498,7 +2595,7 @@
             overflow-y: auto; width: 50%; max-width: 450px; margin: 0 auto; line-height: 1.4;
             pointer-events: auto; /* scrollable/selectable text shouldn't close on click */
         }
-        #${LIGHTBOX_ID} .bgt-lb-text { max-height: 22vh; font-size: 14px; color: #f1f3f5; line-height: 0.9; }
+        #${LIGHTBOX_ID} .bgt-lb-text { max-height: 22vh; font-size: 14px; color: #f1f3f5; line-height: 1.2; }
         #${LIGHTBOX_ID} .bgt-lb-cap { max-height: 14vh; font-size: 13px; color: #d2d9e0; }
         #${LIGHTBOX_ID} .bgt-lb-post { color: #4aa8ff; text-decoration: none; white-space: nowrap; }
         #${LIGHTBOX_ID} .bgt-lb-text a.bgt-lb-link, #${LIGHTBOX_ID} .bgt-lb-cap a.bgt-lb-link {
@@ -2626,6 +2723,10 @@
         // so a pending deep-link keeps retrying until the pager paints.
         setInterval(() => {
             if (routeSig() !== lastSig) onRouteChange();
+            // Watchdog: a Bluesky re-render (e.g. crossing a responsive layout
+            // breakpoint) can detach the in-line gallery without any route/tab
+            // change; remount it.
+            else if (galleryEnabled && rootEl && !rootEl.isConnected) syncGallery();
             tickTabSync();
         }, 500);
 
