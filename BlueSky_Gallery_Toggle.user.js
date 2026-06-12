@@ -4,7 +4,7 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.10.0
+// @version      2.11.0
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky
 // @supportURL   https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/issues
@@ -321,6 +321,24 @@
                     thumb: img.thumb,
                     full: img.fullsize,   // already @jpeg from the AppView
                     alt: img.alt || '',
+                    url: postUrl(post),
+                    postState: ps,
+                });
+            });
+        } else if (type === 'app.bsky.embed.gallery#view' && Array.isArray(embed.items)) {
+            // Multi-image "Gallery" embed (June 2026): up to 10 images per post
+            // (lexicon ceiling is 20). Items are a $type union - today only
+            // #viewImage exists, but the lexicon reserves room for other media
+            // kinds, so skip anything unrecognised instead of rendering a broken
+            // tile. viewImage uses `thumbnail` where images#view uses `thumb`.
+            const ps = postStateFrom(post); // shared across this post's image tiles
+            embed.items.forEach(item => {
+                if (item.$type !== 'app.bsky.embed.gallery#viewImage') return;
+                tiles.push({
+                    kind: 'image',
+                    thumb: item.thumbnail,
+                    full: item.fullsize,
+                    alt: item.alt || '',
                     url: postUrl(post),
                     postState: ps,
                 });
