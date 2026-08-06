@@ -4,7 +4,7 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.11.0
+// @version      2.12.0
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky
 // @supportURL   https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/issues
@@ -312,9 +312,14 @@
             embed = embed.media;
         }
         const type = embed.$type;
+        // How many media items the embed *says* it carries. Compared against the tiles
+        // we actually built (see the tail of this function) so a payload shape we don't
+        // understand shows up as a logged discrepancy instead of a silently short post.
+        let declared = 0;
 
         if (type === 'app.bsky.embed.images#view' && Array.isArray(embed.images)) {
             const ps = postStateFrom(post); // shared across this post's image tiles
+            declared = embed.images.length;
             embed.images.forEach(img => {
                 tiles.push({
                     kind: 'image',
@@ -332,6 +337,7 @@
             // kinds, so skip anything unrecognised instead of rendering a broken
             // tile. viewImage uses `thumbnail` where images#view uses `thumb`.
             const ps = postStateFrom(post); // shared across this post's image tiles
+            declared = embed.items.length;
             embed.items.forEach(item => {
                 if (item.$type !== 'app.bsky.embed.gallery#viewImage') return;
                 tiles.push({
@@ -369,7 +375,24 @@
                     url: postUrl(post),
                 });
             }
+            declared = tiles.length; // a non-gif external embed is legitimately no media
         }
+
+        // An embed that declares more media than we turned into tiles means part of the
+        // payload didn't match anything we know how to render (a new item $type, a
+        // renamed thumbnail field, ...). Record it so bgtAudit() can list it later.
+        if (declared > tiles.length) {
+            recordDrop({
+                reason: 'embed declared ' + declared + ' media, only ' + tiles.length + ' recognised',
+                post: postUrl(post), image: '-', embedType: type, embed,
+            });
+        }
+        // Identity for the grid's dedupe: this post's Nth media item. Deliberately NOT
+        // the thumbnail URL - that's derived from the blob's CID, so two posts sharing
+        // an image (a re-upload, the same photo in a later thread) collide and whichever
+        // loads second silently loses that tile. Post-uri + slot only ever repeats for a
+        // genuine repeat of the same post, which is what feed pagination can hand us.
+        tiles.forEach((t, i) => { t._postIdx = i; t._postDeclared = declared; t._key = post.uri + '#' + i; });
         return tiles;
     }
 
@@ -418,7 +441,18 @@
         failed: false, // last page failed: pause infinite scroll until the Retry button clears it
         gen: 0,        // bumped per openGallery; in-flight loads check it before touching state
         items: [], seen: null, // lightbox-viewable items (images + native videos), in grid order
+        drops: [],             // media the grid discarded, for bgtAudit() (see recordDrop)
     };
+
+    // Anything that should have been a tile but wasn't. Kept unconditionally (it's a
+    // handful of small objects) so bgtAudit() can explain a short post even when Debug
+    // logging was off while the page loaded; bounded so a long scroll can't grow it
+    // without limit.
+    const DROP_LOG_MAX = 500;
+    function recordDrop(rec) {
+        if (grid.drops.length < DROP_LOG_MAX) grid.drops.push(rec);
+        logDebug('media dropped:', rec);
+    }
     let rootEl, scrollEl, gridEl, sentinelEl, countEl, io, overlayKeyHandler;
     let mountedMode = null, inlineHost = null, inlineResizeHandler = null;
     let headerTitleEl = null, followBtn = null, inlineScrollHandler = null, followVisTick = false;
@@ -658,9 +692,20 @@
     function appendTiles(tiles) {
         const frag = document.createDocumentFragment();
         tiles.forEach(t => {
-            const key = t.thumb || (t.url + t.alt);
-            if (grid.seen.has(key)) return;
-            grid.seen.add(key);
+            const key = t._key || t.thumb || (t.url + t.alt);
+            const owner = grid.seen.get(key);
+            if (owner !== undefined) {
+                // Keyed on post-uri + slot, so this only fires for a true repeat of the
+                // same post - feed pages can overlap around a cursor boundary.
+                recordDrop({
+                    reason: 'this post + slot already loaded (feed page overlap)',
+                    post: t.url,
+                    image: t._postIdx != null ? (t._postIdx + 1) + ' of ' + t._postDeclared : '?',
+                    shownBy: owner, key,
+                });
+                return;
+            }
+            grid.seen.set(key, t.url);
             // Images and native videos (those with an HLS playlist) are viewable in the
             // lightbox; GIF/external embeds have no playlist, so they stay click-to-post.
             if (t.kind === 'image' || (t.kind === 'video' && t.playlist)) {
@@ -725,6 +770,84 @@
         const s = sentinelEl.getBoundingClientRect();
         const bottom = scrollEl ? scrollEl.getBoundingClientRect().bottom : window.innerHeight;
         if (s.top <= bottom + 800) loadMore();
+    }
+
+    /* ======================================================================
+     * 4a. Diagnostics. Console-only, no UI - for answering "this post has four
+     *     images but the gallery shows three". Exposed on the page window at the
+     *     bottom of the file:
+     *
+     *       bgtAudit()        - everything the open gallery discarded, and why.
+     *       bgtInspect(url)   - re-fetch one post and line the API's media up
+     *                           against the tiles that actually made it in.
+     * ==================================================================== */
+    async function xrpcGet(method, params) {
+        const path = '/xrpc/' + method + '?' + new URLSearchParams(params).toString();
+        if (auth.origin && auth.headers) { // authed first, so moderated media resolves
+            try {
+                const res = await nativeFetch(auth.origin + path, { headers: auth.headers, credentials: 'omit' });
+                if (res.ok) return res.json();
+            } catch (e) { /* fall through to public */ }
+        }
+        const res = await nativeFetch(PUBLIC_API + path, { headers: { 'accept-language': navigator.language || 'en' } });
+        if (!res.ok) throw new Error(method + ' ' + res.status);
+        return res.json();
+    }
+
+    // bsky.app/profile/<handle|did>/post/<rkey> -> at://<did>/app.bsky.feed.post/<rkey>
+    async function toAtUri(ref) {
+        ref = String(ref || '').trim();
+        if (ref.indexOf('at://') === 0) return ref;
+        const m = ref.match(/\/profile\/([^/]+)\/post\/([^/?#]+)/);
+        if (!m) throw new Error('not a post URL or at:// uri: ' + ref);
+        let did = decodeURIComponent(m[1]);
+        if (did.indexOf('did:') !== 0) did = (await xrpcGet('app.bsky.actor.getProfile', { actor: did })).did;
+        return 'at://' + did + '/app.bsky.feed.post/' + m[2];
+    }
+
+    function auditGrid() {
+        const drops = grid.drops || [];
+        console.log('[Gallery Toggle] audit: ' + (grid.seen ? grid.seen.size : 0) + ' tiles, ' +
+            grid.items.length + ' lightbox items, ' + drops.length + ' dropped' +
+            (drops.length >= DROP_LOG_MAX ? ' (drop log full)' : ''));
+        if (drops.length) console.table(drops.map(d => ({ reason: d.reason, image: d.image, post: d.post, shownBy: d.shownBy || '' })));
+        else console.log('[Gallery Toggle] nothing dropped in what has loaded so far.');
+        return drops;
+    }
+
+    async function inspectPost(ref) {
+        const uri = await toAtUri(ref);
+        const post = ((await xrpcGet('app.bsky.feed.getPosts', { uris: uri })).posts || [])[0];
+        if (!post) { console.warn('[Gallery Toggle] post not returned (deleted, blocked, or hidden from this session):', uri); return null; }
+
+        let embed = post.embed;
+        if (embed && embed.$type === 'app.bsky.embed.recordWithMedia#view' && embed.media) embed = embed.media;
+        // Flatten whatever shape the embed is into one row per media item, reading both
+        // the images#view (`thumb`) and gallery#view (`thumbnail`) field names so a
+        // lexicon change shows up as an empty thumb rather than a silent skip.
+        const api = [];
+        if (embed && Array.isArray(embed.images)) embed.images.forEach((im, i) => api.push({ n: i + 1, type: im.$type || 'image', thumb: im.thumb, alt: im.alt || '' }));
+        else if (embed && Array.isArray(embed.items)) embed.items.forEach((im, i) => api.push({ n: i + 1, type: im.$type, thumb: im.thumbnail || im.thumb, alt: im.alt || '' }));
+        else if (embed) api.push({ n: 1, type: embed.$type, thumb: embed.thumbnail || (embed.external && embed.external.thumb), alt: embed.alt || '' });
+
+        const url = postUrl(post);
+        const inGrid = grid.items.filter(it => it.url === url);
+        const drops = (grid.drops || []).filter(d => d.post === url);
+        // What the grid's own parser makes of this post today. It records into
+        // grid.drops as a side effect, so roll that back - inspecting shouldn't
+        // add phantom entries to the audit log.
+        const dropMark = grid.drops.length;
+        const built = tilesFromPost(post);
+        grid.drops.length = dropMark;
+
+        console.log('[Gallery Toggle] ' + url);
+        console.log('  embed type: ' + (embed ? embed.$type : '(none)') +
+            ' | API media: ' + api.length + ' | parser builds: ' + built.length +
+            ' | in grid: ' + inGrid.length + ' | dropped: ' + drops.length);
+        console.table(api.map(a => ({ n: a.n, type: a.type, alt: a.alt, inGrid: inGrid.some(it => it.thumb === a.thumb), thumb: a.thumb })));
+        if (drops.length) console.table(drops);
+        console.log('  raw embed:', embed);
+        return { post, embed, api, built, inGrid, drops };
     }
 
     /* ======================================================================
@@ -2009,7 +2132,8 @@
         grid.loading = false;
         grid.failed = false;
         grid.items = [];
-        grid.seen = new Set();
+        grid.seen = new Map(); // thumb key -> URL of the post that claimed it (for bgtAudit)
+        grid.drops = [];
 
         // Reset per-profile identity/follow state; loadProfile() fills it in async.
         profile.actor = actor; profile.did = null; profile.handle = null;
@@ -2757,6 +2881,12 @@
     } catch (e) {
         console.error('[Gallery Toggle] fetch hook failed:', e);
     }
+
+    // Diagnostics reachable from the page console (the userscript scope isn't).
+    try {
+        unsafeWindow.bgtAudit = auditGrid;
+        unsafeWindow.bgtInspect = inspectPost;
+    } catch (e) { /* ignore */ }
 
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', startDom);
