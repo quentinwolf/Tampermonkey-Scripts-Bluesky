@@ -4,7 +4,7 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.15.0
+// @version      2.17.0
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky
 // @supportURL   https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/issues
@@ -405,7 +405,7 @@
                 tiles.push({
                     kind: 'image',
                     thumb: img.thumb,
-                    full: img.fullsize,   // already @jpeg from the AppView
+                    full: img.fullsize,   // bare CDN URL (no @format): the CDN negotiates webp
                     alt: img.alt || '',
                     url: postUrl(post),
                     postState: ps,
@@ -745,7 +745,18 @@
     }
 
     function makeTile(t) {
-        const img = el('img', { src: t.thumb, alt: t.alt, loading: 'lazy', draggable: false });
+        // data-keep-thumbnail is the opt-out honoured by the companion "View Original
+        // Images" userscript, which otherwise rewrites every feed_thumbnail on the page
+        // to its feed_fullsize twin. Measured on a 2140x2000 upload, that is the
+        // difference between a 1000x935 / 95 KB file and a 2140x2000 / 279 KB one - per
+        // tile, on a grid that draws them at 120-210px. feed_thumbnail is the smallest
+        // variant the AppView offers (feed_fullsize doesn't downscale at all, it only
+        // re-encodes), so the tile loads the thumb and a drag hands out that same
+        // thumb; full resolution belongs to the lightbox.
+        const img = el('img', {
+            src: t.thumb, alt: t.alt, loading: 'lazy',
+            draggable: true, 'data-keep-thumbnail': '1',
+        });
         // Real anchor (not a button) so the browser's own link affordances all point
         // at the actual post: middle-click / ctrl- / shift-click open it in a new tab,
         // and the right-click menu offers "Open in new tab" + "Copy link". We only
@@ -1598,7 +1609,7 @@
             showLbLoading();
             lbImg.onload = () => { lbImg.classList.add('bgt-loaded'); hideLbLoading(); };
             lbImg.onerror = () => lbLoadError();
-            lbImg.src = it.full;
+            lbImg.src = fullUrl(it);
             if (lbImg.complete && lbImg.naturalWidth > 0) { lbImg.classList.add('bgt-loaded'); hideLbLoading(); }
         }
         lbLink.href = it.url;
@@ -1661,7 +1672,7 @@
                     class: 'bgt-lb-thumb', type: 'button', 'data-idx': String(idx),
                     title: it.alt || ('Image ' + (idx - lo + 1)),
                     onClick: (e) => { e.stopPropagation(); if (idx !== lbIndex) { lbIndex = idx; showLightbox(); } },
-                }, el('img', { src: it.thumb, alt: '', draggable: false })));
+                }, el('img', { src: it.thumb, alt: '', draggable: false, 'data-keep-thumbnail': '1' })));
             }
             thumbsRange = [lo, hi];
         }
@@ -1835,6 +1846,28 @@
      * fetch. Keep a small buffer of upcoming `full` images warm in the browser's HTTP
      * cache so showing them is near-instant. Bounded by LB_PREFETCH_CACHE for memory.
      * ----------------------------------------------------------------------------- */
+    /* ---- companion-script coordination -------------------------------------------
+     * The "View Original Images" userscript rewrites any feed_fullsize <img> whose URL
+     * carries no @format suffix to the @jpeg variant. That runs *after* we set the src,
+     * so the lightbox fetched each image twice - once as the CDN's negotiated webp, then
+     * again as jpeg - and, worse, warmImage kept warming the webp URL that never ended up
+     * displayed, quietly making the whole LB_PREFETCH_AHEAD buffer do nothing.
+     *
+     * Applying the same normalisation ourselves keeps display and prefetch on one URL.
+     * It's gated on the flag that script sets on <html>, so with it uninstalled we stay on
+     * the smaller webp (measured 1128 KB vs 1760 KB on a 2892x3698 upload).
+     * ----------------------------------------------------------------------------- */
+    function viewOriginalActive() {
+        return document.documentElement.hasAttribute('data-bsky-view-original');
+    }
+
+    // The URL the lightbox will actually end up displaying for this item - the single
+    // source of truth for both <img>.src and the prefetch, so the two can't diverge.
+    function fullUrl(it) {
+        const u = (it && it.full) || '';
+        return (u && viewOriginalActive() && !/@\w+$/.test(u)) ? u + '@jpeg' : u;
+    }
+
     function warmImage(url) {
         if (!url) return;
         if (lbPrefetch.has(url)) {                    // LRU touch: move to the freshest slot
@@ -1858,7 +1891,7 @@
     // Only still images have a `full` worth warming; videos stream via HLS and their
     // poster is the thumb already loaded by the grid.
     function prefetchItem(it) {
-        if (it && it.kind === 'image' && it.full) warmImage(it.full);
+        if (it && it.kind === 'image' && it.full) warmImage(fullUrl(it));
     }
 
     // Warm LB_PREFETCH_AHEAD images in the direction of travel (plus one behind, for a
