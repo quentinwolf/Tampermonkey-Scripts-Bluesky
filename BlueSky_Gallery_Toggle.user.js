@@ -4,7 +4,7 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.18.0
+// @version      2.19.0
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky
 // @supportURL   https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/issues
@@ -2610,6 +2610,45 @@
      * ==================================================================== */
     let settingsKeyHandler;
 
+    /* ---- sectioned panel ---------------------------------------------------------
+     * The panel is a fixed-size dialog: a rail of sections on the left, one section
+     * visible on the right. Every section is built up front and switched by display
+     * alone - never rebuilt - so the reveal-in-place blocks (wheel / tooltip sub-
+     * options) and any half-finished interaction survive a tab switch, and each
+     * control keeps the single listener it was created with.
+     *
+     * The win over one long list is that the dialog's size no longer tracks the number
+     * of settings: a new row grows its section, not the window. The pane still scrolls,
+     * as the floor for short viewports and for whichever section grows tallest.
+     * ---------------------------------------------------------------------------- */
+    let settingsSection = 'layout'; // remembered for the session, not persisted
+
+    function settingsTab(id, label) {
+        return el('button', {
+            class: 'bgt-tab' + (settingsSection === id ? ' bgt-on' : ''),
+            type: 'button', 'data-sec': id,
+            onClick: () => showSettingsSection(id),
+        }, label);
+    }
+
+    // `nodes` is an array - el() flattens arrays of children, so sections can be
+    // assembled as plain lists.
+    function settingsPage(id, nodes) {
+        return el('div', {
+            class: 'bgt-sec' + (settingsSection === id ? ' bgt-on' : ''), 'data-sec': id,
+        }, nodes);
+    }
+
+    function showSettingsSection(id) {
+        settingsSection = id;
+        const root = document.getElementById(SETTINGS_ID);
+        if (!root) return;
+        root.querySelectorAll('.bgt-tab').forEach(b => b.classList.toggle('bgt-on', b.getAttribute('data-sec') === id));
+        root.querySelectorAll('.bgt-sec').forEach(s => s.classList.toggle('bgt-on', s.getAttribute('data-sec') === id));
+        const pane = root.querySelector('.bgt-settings-pane');
+        if (pane) pane.scrollTop = 0; // a section always opens at its top
+    }
+
     function modeRow(value, label, desc) {
         const input = el('input', {
             type: 'radio', name: 'bgt-mode', value: value, checked: settings.mode === value,
@@ -2816,8 +2855,8 @@
             setTimeout(() => { if (didBtn.isConnected) { didBtn.textContent = 'Clear'; paintDid(); } }, 1600);
         });
         paintDid();
-        const card = el('div', { class: 'bgt-settings-card' },
-            el('h2', {}, 'Gallery settings'),
+        // Layout - where the grid lives and how big its tiles are.
+        const secLayout = settingsPage('layout', [
             el('div', { class: 'bgt-settings-sub' }, 'How should the media grid appear?'),
             modeRow('fullscreen', 'Full screen', 'Takes over the whole window (default). Most reliable.'),
             modeRow('inline', 'In-line', 'Embeds the grid in the profile page, keeping the sidebar and header. Depends on Bluesky’s layout, so it may fall back to full screen.'),
@@ -2827,6 +2866,10 @@
                 sizeChip('medium', 'Medium'),
                 sizeChip('large', 'Large')),
             el('div', { class: 'bgt-settings-hint' }, 'In-line columns: 5 · 4 · 3'),
+        ]);
+
+        // Grid - what the tiles themselves load and reveal on hover.
+        const secGrid = settingsPage('grid', [
             el('div', { class: 'bgt-settings-label' }, 'Thumbnail format'),
             el('div', { class: 'bgt-size-group' },
                 thumbFormatRadio('webp', 'WebP'),
@@ -2836,6 +2879,10 @@
                 el('input', { type: 'checkbox', checked: settings.tooltip, onChange: (e) => { setTooltip(e.target.checked); tooltipSub.style.display = e.target.checked ? 'block' : 'none'; } }),
                 el('span', {}, 'Enable gallery tooltip hover')),
             tooltipSub,
+        ]);
+
+        // Viewer - everything that only applies once an item is open in the lightbox.
+        const secViewer = settingsPage('viewer', [
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.postInfo, onChange: (e) => setPostInfo(e.target.checked) }),
                 el('span', {}, 'Show post text in the lightbox')),
@@ -2855,6 +2902,10 @@
                 bitrateInput,
                 el('span', { class: 'bgt-bitrate-unit' }, 'Mbps')),
             el('div', { class: 'bgt-settings-hint' }, 'Bandwidth hls.js assumes for the first video segment (1–25). Higher loads sharper sooner; lower it if you ever see stalls.'),
+        ]);
+
+        // Advanced - integration points and diagnostics; nothing you need day to day.
+        const secAdvanced = settingsPage('advanced', [
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.tabHash, onChange: (e) => setTabHashSync(e.target.checked) }),
                 el('span', {}, 'Sync profile tab to URL hash')),
@@ -2865,6 +2916,17 @@
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.debug, onChange: (e) => setDebug(e.target.checked) }),
                 el('span', {}, 'Debug logging to console')),
+        ]);
+
+        const card = el('div', { class: 'bgt-settings-card' },
+            el('h2', {}, 'Gallery settings'),
+            el('div', { class: 'bgt-settings-body' },
+                el('div', { class: 'bgt-settings-rail' },
+                    settingsTab('layout', 'Layout'),
+                    settingsTab('grid', 'Grid'),
+                    settingsTab('viewer', 'Viewer'),
+                    settingsTab('advanced', 'Advanced')),
+                el('div', { class: 'bgt-settings-pane' }, secLayout, secGrid, secViewer, secAdvanced)),
             el('div', { class: 'bgt-settings-foot' }, el('button', { onClick: closeSettings }, 'Done'))
         );
         const backdrop = el('div', {
@@ -3203,13 +3265,47 @@
             display: flex; align-items: center; justify-content: center;
             font-family: InterVariable, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, sans-serif;
         }
+        /* Fixed-size dialog: title, then a rail + one visible section, then the footer.
+           max-height is the floor that stops a tall section (or a short window) pushing
+           content past the viewport edges - the backdrop centres the card, so anything
+           that overflows is clipped at BOTH ends and unreachable without it. */
         #${SETTINGS_ID} .bgt-settings-card {
-            width: 400px; max-width: 92vw; background: #1b2530; color: #f1f3f5;
+            width: 640px; max-width: 92vw; max-height: min(88vh, 620px);
+            display: flex; flex-direction: column;
+            background: #1b2530; color: #f1f3f5;
             border: 1px solid #2a3743; border-radius: 14px; padding: 18px 20px;
             box-shadow: 0 14px 50px rgba(0,0,0,0.55);
         }
-        #${SETTINGS_ID} h2 { margin: 0 0 4px; font-size: 18px; }
+        #${SETTINGS_ID} h2 { margin: 0 0 14px; font-size: 18px; flex: 0 0 auto; }
         #${SETTINGS_ID} .bgt-settings-sub { color: #8b98a5; font-size: 13px; margin-bottom: 14px; }
+        /* min-height:0 is what actually lets the pane scroll: without it a flex child
+           refuses to shrink below its content, so the body grows and the card overflows
+           again no matter what max-height says. */
+        #${SETTINGS_ID} .bgt-settings-body { display: flex; gap: 16px; flex: 1 1 auto; min-height: 0; }
+        #${SETTINGS_ID} .bgt-settings-rail { flex: 0 0 148px; display: flex; flex-direction: column; gap: 2px; }
+        #${SETTINGS_ID} .bgt-tab {
+            display: block; width: 100%; text-align: left; padding: 9px 12px;
+            border: none; border-radius: 8px; background: transparent; color: #c3ccd6;
+            font-size: 14px; font-weight: 600; font-family: inherit; cursor: pointer;
+            transition: background-color 120ms ease, color 120ms ease;
+        }
+        #${SETTINGS_ID} .bgt-tab:hover { background: rgba(255,255,255,0.05); }
+        #${SETTINGS_ID} .bgt-tab.bgt-on { background: rgba(0,133,255,0.16); color: #f1f3f5; }
+        #${SETTINGS_ID} .bgt-settings-pane { flex: 1 1 auto; min-width: 0; overflow-y: auto; padding-right: 6px; }
+        #${SETTINGS_ID} .bgt-sec { display: none; }
+        #${SETTINGS_ID} .bgt-sec.bgt-on { display: block; }
+        /* Labels and check rows carry a top margin meant for mid-list spacing; at the
+           head of a section that reads as a stray gap under the tab rail. */
+        #${SETTINGS_ID} .bgt-sec > *:first-child { margin-top: 0; }
+        /* Narrow viewport: a 148px rail would eat the content pane, so lay the sections
+           out as a scrollable row of chips above it instead. */
+        @media (max-width: 620px) {
+            #${SETTINGS_ID} .bgt-settings-body { flex-direction: column; gap: 12px; }
+            #${SETTINGS_ID} .bgt-settings-rail {
+                flex: 0 0 auto; flex-direction: row; gap: 6px; overflow-x: auto; padding-bottom: 2px;
+            }
+            #${SETTINGS_ID} .bgt-tab { width: auto; flex: 0 0 auto; text-align: center; padding: 8px 12px; }
+        }
         #${SETTINGS_ID} .bgt-radio {
             display: flex; gap: 10px; align-items: flex-start; padding: 11px 12px;
             border: 1px solid #2a3743; border-radius: 10px; margin-bottom: 9px; cursor: pointer;
@@ -3249,7 +3345,7 @@
         #${SETTINGS_ID} .bgt-wheel-sub { margin: 6px 0 2px 4px; padding-left: 10px; border-left: 2px solid #2a3743; }
         #${SETTINGS_ID} .bgt-check-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 13px; color: #c3ccd6; cursor: pointer; }
         #${SETTINGS_ID} .bgt-check-row input { accent-color: #0085ff; }
-        #${SETTINGS_ID} .bgt-settings-foot { display: flex; justify-content: flex-end; margin-top: 12px; }
+        #${SETTINGS_ID} .bgt-settings-foot { display: flex; justify-content: flex-end; margin-top: 14px; flex: 0 0 auto; }
         #${SETTINGS_ID} .bgt-settings-foot button {
             background: #0085ff; color: #fff; border: none; border-radius: 8px;
             padding: 8px 18px; font-size: 14px; font-weight: 600; cursor: pointer;
