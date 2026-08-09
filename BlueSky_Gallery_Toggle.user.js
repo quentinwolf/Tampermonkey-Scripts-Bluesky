@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Bluesky Gallery Toggle
-// @description  Replaces a profile's Media view with an x.com-style media grid (images + video), fed live by the AT Protocol API with infinite scroll. Full-screen or in-line.
+// @description  Replaces a profile's Media view with an x.com-style media grid (images + video), fed live by the AT Protocol API with infinite scroll. Full-screen or in-line. Also opens a single post's media in the same viewer.
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.12.0
+// @version      2.13.0
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky
 // @supportURL   https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/issues
@@ -65,6 +65,8 @@
     const ICON_EXT = 'M14 3h7v7h-2V6.41l-9.29 9.3-1.42-1.42 9.3-9.29H14V3zM5 5h5v2H7v10h10v-3h2v5H5V5z';
     const ICON_PLAY = 'M8 5v14l11-7z';
     const ICON_PLUS = 'M11 5a1 1 0 0 1 2 0v6h6a1 1 0 1 1 0 2h-6v6a1 1 0 1 1-2 0v-6H5a1 1 0 1 1 0-2h6V5z';
+    // Expand-corners: the nav button's "open this post in the viewer" affordance.
+    const ICON_EXPAND = 'M4 4h6v2H6v4H4V4zm10 0h6v6h-2V6h-4V4zM4 14h2v4h4v2H4v-6zm14 0h2v6h-6v-2h4v-4z';
 
     // Post-action icons (lifted from Bluesky's own buttons so the lightbox bar
     // matches the native look). Heart + bookmark have a filled variant for the
@@ -467,6 +469,14 @@
     // when we just unfollowed. Trusted over the AppView for FOLLOW_TRUST_MS.
     const FOLLOW_TRUST_MS = 15000;
     const recentFollow = { did: null, uri: null, at: 0 };
+
+    // Blank the viewed-profile state before a loadProfile() fills it in, so the header
+    // and lightbox never show the previous profile's handle or follow state.
+    function resetProfileState(actor) {
+        profile.actor = actor; profile.did = null; profile.handle = null;
+        profile.displayName = ''; profile.followUri = null; profile.isMe = false;
+        profile.viewerKnown = false; profile._busyFollow = false;
+    }
 
     // One Follow/Following pill, reused by the header bar and the lightbox. Starts
     // hidden; updateFollowButton()/updateFollowVisibility() drive its state + display.
@@ -1925,6 +1935,169 @@
         if (lbUrlTimer) { clearTimeout(lbUrlTimer); lbUrlTimer = null; }
         if (lbReturnUrl != null && location.href === lbAppliedUrl) lbSetUrl(lbReturnUrl);
         lbReturnUrl = lbAppliedUrl = null;
+        // The single-post viewer only lives as long as its lightbox; releasing the flag
+        // here lets the next route change tear the (now hidden) dialog down normally.
+        postMode.active = false;
+    }
+
+    /* ======================================================================
+     * 5b. Single-post viewer.
+     *
+     *     On a /profile/<actor>/post/<rkey> page there's no grid to click, so the
+     *     lightbox is unreachable - a shame for video, where the only alternatives
+     *     are the small in-feed player and the browser's own full-screen. The nav
+     *     button grows an expand icon on post pages: it fetches just that post,
+     *     fills grid.items with its media, and opens the same lightbox.
+     *
+     *     No overlay is mounted (rootEl stays null), which is what keeps this cheap
+     *     and contained: loadMore() bails without a rootEl, so nothing paginates and
+     *     the page underneath is left exactly as Bluesky drew it.
+     * ==================================================================== */
+    const POSTBTN_TITLE = 'Open this post in the gallery viewer';
+    const POST_CACHE_MAX = 10;
+    const postCache = new Map();  // '<actor>/<rkey>' -> { items, aliases } for one post
+    // rkey + aliases identify the post the open viewer belongs to; busy guards double-clicks
+    // while the fetch is in flight. Cleared by closeLightbox.
+    const postMode = { active: false, rkey: null, aliases: null, busy: false };
+    let postBtnKey = null;        // post the nav button's current state refers to
+
+    function currentPostRoute() {
+        const m = location.pathname.match(/^\/profile\/([^/]+)\/post\/([^/?#]+)\/?$/);
+        if (!m) return null;
+        const actor = decodeURIComponent(m[1]);
+        return { actor: actor, rkey: m[2], key: actor.toLowerCase() + '/' + m[2] };
+    }
+
+    // True while the viewer is open on the post it was opened from. The lightbox mirrors
+    // each item into the address bar, which the route poller reads as a change; without
+    // this, syncGallery would tear the viewer down the moment it opened.
+    function postViewerHolding() {
+        if (!postMode.active || !lbEl || lbEl.style.display === 'none') return false;
+        const r = currentPostRoute();
+        return !!r && r.rkey === postMode.rkey && postMode.aliases.has(r.actor.toLowerCase());
+    }
+
+    // The bar may hold a did: URL while the post carries a handle (or the reverse, once
+    // the lightbox rewrites it), so hold every spelling of the author we know.
+    function actorAliases(urlActor, author) {
+        const s = new Set([String(urlActor).toLowerCase()]);
+        if (author) {
+            if (author.handle) s.add(String(author.handle).toLowerCase());
+            if (author.did) s.add(String(author.did).toLowerCase());
+        }
+        return s;
+    }
+
+    // grid.items shape, from one post's tiles. GIF / external embeds carry no playlist
+    // and so have no viewer slot - the same rule the grid applies.
+    function viewerItemsFrom(post) {
+        return tilesFromPost(post)
+            .filter(t => t.kind === 'image' || (t.kind === 'video' && t.playlist))
+            .map(t => ({
+                kind: t.kind, full: t.full, thumb: t.thumb, alt: t.alt, url: t.url,
+                playlist: t.playlist, aspectRatio: t.aspectRatio, postState: t.postState,
+            }));
+    }
+
+    function cachePost(key, entry) {
+        postCache.delete(key);          // re-insert so the map orders oldest-first
+        postCache.set(key, entry);
+        while (postCache.size > POST_CACHE_MAX) postCache.delete(postCache.keys().next().value);
+    }
+
+    async function openPostInViewer() {
+        const r = currentPostRoute();
+        if (!r || postMode.busy) return;
+        postMode.busy = true;
+        setPostBtn('busy', 'Loading post media…');
+        // Hand grid.actor back on any path that doesn't open a viewer - but never if a
+        // real gallery mounted (rootEl) for that actor while we were fetching, since
+        // its loadMore reads the same field.
+        const releaseActor = () => { if (grid.actor === r.actor && !rootEl) grid.actor = null; };
+        try {
+            // Identity for the lightbox's handle + follow corner. grid.actor has to be set
+            // first: loadProfile discards its result if the gallery moved on while it waited.
+            grid.actor = r.actor;
+            resetProfileState(r.actor);
+            const profileLoad = loadProfile(r.actor);
+
+            let entry = postCache.get(r.key);
+            if (entry) cachePost(r.key, entry); // cache hit: refresh its position
+            else {
+                // getPosts needs an at:// uri, so a handle URL costs one resolve - which is
+                // the getProfile loadProfile is already making, so just wait on that.
+                let did = r.actor.indexOf('did:') === 0 ? r.actor : null;
+                if (!did) { await profileLoad; did = profile.did; }
+                if (!did) throw new Error('could not resolve @' + r.actor);
+                const uri = 'at://' + did + '/app.bsky.feed.post/' + r.rkey;
+                const post = ((await xrpcGet('app.bsky.feed.getPosts', { uris: uri })).posts || [])[0];
+                if (!post) throw new Error('post not returned (deleted, blocked, or hidden from this session)');
+                grid.drops = []; // tilesFromPost records into this; keep it scoped to this post
+                entry = { items: viewerItemsFrom(post), aliases: actorAliases(r.actor, post.author) };
+                cachePost(r.key, entry);
+            }
+
+            // Navigated away while the fetch was in flight: this post isn't what's on
+            // screen any more, so don't pull a viewer open over whatever is.
+            const now = currentPostRoute();
+            if (!now || now.key !== r.key) { logDebug('post viewer: route moved on, discarding ' + r.key); releaseActor(); return; }
+
+            if (!entry.items.length) {
+                logDebug('post viewer: nothing viewable in ' + r.key);
+                setPostBtn('none', 'No viewable media in this post');
+                releaseActor();
+                return;
+            }
+
+            grid.items = entry.items;
+            grid.seen = new Map();
+            grid.cursor = undefined;
+            grid.videosOnly = false;
+            grid.done = true;  // one post, nothing to page - stops showLightbox calling loadMore
+            grid.loading = grid.failed = false;
+            postMode.active = true;
+            postMode.rkey = r.rkey;
+            postMode.aliases = entry.aliases;
+            setPostBtn('idle');
+            logDebug('post viewer: ' + entry.items.length + ' item(s) from ' + r.key);
+            openLightbox(0);
+        } catch (e) {
+            console.error('[Gallery Toggle] post viewer failed' + staleHint() + ':', e);
+            setPostBtn('none', 'Could not load this post (' + (e && e.message ? e.message : 'error') + ')');
+            releaseActor();
+        } finally {
+            postMode.busy = false;
+        }
+    }
+
+    function postBtnEl() {
+        const btn = document.getElementById(BTN_ID);
+        return btn ? btn.querySelector('.bgt-postbtn') : null;
+    }
+
+    // 'busy' while the fetch runs, 'none' for a post with nothing to show (text-only,
+    // GIF-only) or a failed load - both dim the icon and explain themselves in the
+    // tooltip, so a click never just silently does nothing.
+    function setPostBtn(state, msg) {
+        const pb = postBtnEl();
+        if (!pb) return;
+        pb.classList.toggle('bgt-busy', state === 'busy');
+        pb.classList.toggle('bgt-none', state === 'none');
+        pb.title = msg || POSTBTN_TITLE;
+    }
+
+    // Show the button only on post pages, and reset the last result when the post
+    // changes (this also runs on theme changes, hence the key check).
+    function updatePostButton() {
+        const pb = postBtnEl();
+        if (!pb) return;
+        const r = currentPostRoute();
+        pb.classList.toggle('bgt-on', !!r);
+        const key = r ? r.key : null;
+        if (key !== postBtnKey) {
+            postBtnKey = key;
+            setPostBtn('idle');
+        }
     }
 
     /* ======================================================================
@@ -2136,9 +2309,7 @@
         grid.drops = [];
 
         // Reset per-profile identity/follow state; loadProfile() fills it in async.
-        profile.actor = actor; profile.did = null; profile.handle = null;
-        profile.displayName = ''; profile.followUri = null; profile.isMe = false;
-        profile.viewerKnown = false; profile._busyFollow = false;
+        resetProfileState(actor);
 
         gridEl = el('div', { class: 'bgt-grid' });
         sentinelEl = el('div', { class: 'bgt-sentinel' }, el('div', { class: 'bgt-spinner' }));
@@ -2240,7 +2411,7 @@
     function syncGallery() {
         const r = currentProfileRoute();
         if (galleryEnabled && r && tabUsesGallery(r.tab)) openGallery(r.actor, r.tab === 'videos');
-        else removeOverlay();
+        else if (!postViewerHolding()) removeOverlay(); // a post page's own viewer isn't ours to close
         updateButtonState();
     }
 
@@ -2480,6 +2651,7 @@
         btn.classList.toggle('bgt-active', galleryEnabled);
         // Match the nav's own text colour so the icon is visible in light AND dark.
         btn.style.color = galleryEnabled ? ACCENT : navTextColor();
+        updatePostButton();
     }
 
     function createButton() {
@@ -2492,6 +2664,12 @@
             class: 'bgt-gear', role: 'button', title: 'Gallery settings',
             onClick: (e) => { e.preventDefault(); e.stopPropagation(); openSettings(); },
         }, svgIcon(ICON_GEAR, 18, 18));
+        // Post pages only (updatePostButton drives the visibility class): open the
+        // post you're reading in the lightbox, without needing a grid to click first.
+        const expand = el('span', {
+            class: 'bgt-postbtn', role: 'button', title: POSTBTN_TITLE,
+            onClick: (e) => { e.preventDefault(); e.stopPropagation(); openPostInViewer(); },
+        }, svgIcon(ICON_EXPAND, 18, 18));
 
         const btn = el('a', {
             id: BTN_ID,
@@ -2502,7 +2680,7 @@
                 GM_setValue(STORAGE_KEY, galleryEnabled);
                 syncGallery();
             },
-        }, icon, text, gear);
+        }, icon, text, gear, expand);
 
         // Layout (flex row, etc.) is pinned with !important in injectStyles(), because
         // Bluesky's base class forces flex-direction:column and the children would
@@ -2536,6 +2714,13 @@
         #${BTN_ID}.bgt-active .bgt-btn-text { font-weight: 600; }
         #${BTN_ID} .bgt-gear { display:inline-flex; align-items:center; margin-left:6px; opacity:0.65; cursor:pointer; }
         #${BTN_ID} .bgt-gear:hover { opacity:1; }
+        /* Open-this-post button: hidden until updatePostButton finds a /post/ route. */
+        #${BTN_ID} .bgt-postbtn { display:none; align-items:center; margin-left:2px; opacity:0.65; cursor:pointer; }
+        #${BTN_ID} .bgt-postbtn.bgt-on { display:inline-flex; }
+        #${BTN_ID} .bgt-postbtn:hover { opacity:1; }
+        #${BTN_ID} .bgt-postbtn.bgt-none { opacity:0.3; }
+        #${BTN_ID} .bgt-postbtn.bgt-busy { animation: bgtfade 1s ease-in-out infinite; }
+        @keyframes bgtfade { 0%,100% { opacity:0.25; } 50% { opacity:0.9; } }
 
         #${OVERLAY_ID} {
             position: fixed; inset: 0; z-index: 99990; background: #0b0f14;
