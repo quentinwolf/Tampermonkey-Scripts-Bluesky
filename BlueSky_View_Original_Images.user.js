@@ -4,7 +4,7 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_view_original_images
-// @version      0.32
+// @version      0.34
 // @license      GPL-3.0-or-later
 // @match        https://bsky.app/*
 // @match        https://av-cdn.bsky.app/img/*
@@ -25,6 +25,12 @@
         window.location.replace(`https://${match[1]}.bsky.app/img/feed_fullsize/plain/${match[2]}/${match[3]}@jpeg`);
         return;
     }
+
+    // Announce ourselves on <html> so companion scripts can adapt rather than fight us.
+    // The Gallery Toggle reads this to pre-apply the @jpeg suffix below to the image its
+    // lightbox is about to show: without it, that image is set as a bare (webp) URL, we
+    // rewrite it a moment later, and the browser fetches the same picture twice.
+    document.documentElement.setAttribute('data-bsky-view-original', '1');
 
     function enableDrag(imgElement) {
         // Set the image and its parents as draggable
@@ -61,7 +67,11 @@
     }
 
     function replaceImageSources() {
-        let images = document.querySelectorAll('img');
+        // data-keep-thumbnail opts an image out. A companion script sets it on images it
+        // deliberately renders small - the Gallery Toggle grid and its lightbox filmstrip -
+        // where upgrading each tile means downloading a full-resolution JPEG to draw it at
+        // ~150px. Those scripts hand out the full-size URL on drag themselves.
+        let images = document.querySelectorAll('img:not([data-keep-thumbnail])');
 
         images.forEach(img => {
             let src = img.getAttribute('src');
@@ -75,19 +85,23 @@
         });
     }
 
-    // Observe for changes in DOM
-    let callback = (mutationsList) => {
-        for (let mutation of mutationsList) {
-            if (mutation.type === 'childList') {
-                replaceImageSources();
-            }
-        }
+    // Observe for changes in DOM. replaceImageSources() sweeps every <img> in the
+    // document, and Bluesky re-renders constantly - a gallery page alone appends ~100
+    // tiles in one go - so running it per mutation record meant dozens of full-document
+    // scans back to back. Collapse each burst into a single scan on the next frame.
+    // (A background tab gets no frames, so its scan waits until you look at it - which
+    // is exactly when the upgraded images could first matter.)
+    let scanQueued = false;
+    const queueScan = () => {
+        if (scanQueued) return;
+        scanQueued = true;
+        requestAnimationFrame(() => { scanQueued = false; replaceImageSources(); });
     };
     const observeConfig = {
         childList: true,
         subtree: true
     };
-    const observer = new MutationObserver(callback);
+    const observer = new MutationObserver(queueScan);
 
     // Start observing
     observer.observe(document.body, observeConfig);
