@@ -4,7 +4,7 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.17.0
+// @version      2.18.0
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky
 // @supportURL   https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/issues
@@ -32,6 +32,7 @@
     const STORAGE_KEY = 'bsky-gallery-enabled';
     const MODE_KEY = 'bsky-gallery-mode';            // 'fullscreen' | 'inline'
     const SIZE_KEY = 'bsky-gallery-size';            // 'small' | 'medium' | 'large'
+    const THUMBFMT_KEY = 'bsky-gallery-thumbfmt';    // 'webp' | 'jpeg': grid thumbnail format
     const DEBUG_KEY = 'bsky-gallery-debug';          // boolean: console logging
     const POSTINFO_KEY = 'bsky-gallery-postinfo';    // boolean: post text in lightbox
     const ALT_KEY = 'bsky-gallery-alt';              // boolean: image alt text in lightbox
@@ -82,6 +83,9 @@
     const settings = {
         mode: GM_getValue(MODE_KEY, 'fullscreen'),
         size: GM_getValue(SIZE_KEY, 'medium'),
+        // webp by default: same picture, ~25% fewer bytes across a whole grid. Only
+        // worth changing if a .webp drag lands somewhere that can't open it.
+        thumbFormat: GM_getValue(THUMBFMT_KEY, 'webp'),
         debug: GM_getValue(DEBUG_KEY, false),
         postInfo: GM_getValue(POSTINFO_KEY, false),
         altText: GM_getValue(ALT_KEY, false),
@@ -744,6 +748,16 @@
         }
     }
 
+    // A thumbnail URL in the user's chosen format. A bare CDN URL is content-negotiated
+    // (webp in every current browser); an @jpeg suffix forces JPEG - larger for the same
+    // picture (91 KB vs 121 KB on a 782x1000 thumb), but it drags out as a .jpg that any
+    // image tool will open. Applied at render time, so the setting can repoint what's
+    // already on screen without rebuilding the grid.
+    function thumbUrl(u) {
+        u = String(u || '').replace(/@\w+$/, '');
+        return (u && settings.thumbFormat === 'jpeg') ? u + '@jpeg' : u;
+    }
+
     function makeTile(t) {
         // data-keep-thumbnail is the opt-out honoured by the companion "View Original
         // Images" userscript, which otherwise rewrites every feed_thumbnail on the page
@@ -754,7 +768,7 @@
         // re-encodes), so the tile loads the thumb and a drag hands out that same
         // thumb; full resolution belongs to the lightbox.
         const img = el('img', {
-            src: t.thumb, alt: t.alt, loading: 'lazy',
+            src: thumbUrl(t.thumb), alt: t.alt, loading: 'lazy',
             draggable: true, 'data-keep-thumbnail': '1',
         });
         // Real anchor (not a button) so the browser's own link affordances all point
@@ -1672,7 +1686,7 @@
                     class: 'bgt-lb-thumb', type: 'button', 'data-idx': String(idx),
                     title: it.alt || ('Image ' + (idx - lo + 1)),
                     onClick: (e) => { e.stopPropagation(); if (idx !== lbIndex) { lbIndex = idx; showLightbox(); } },
-                }, el('img', { src: it.thumb, alt: '', draggable: false, 'data-keep-thumbnail': '1' })));
+                }, el('img', { src: thumbUrl(it.thumb), alt: '', draggable: false, 'data-keep-thumbnail': '1' })));
             }
             thumbsRange = [lo, hi];
         }
@@ -2620,6 +2634,14 @@
         return el('label', { class: 'bgt-size-chip' }, input, label);
     }
 
+    function thumbFormatRadio(value, label) {
+        const input = el('input', {
+            type: 'radio', name: 'bgt-thumbfmt', value: value, checked: settings.thumbFormat === value,
+            onChange: () => setThumbFormat(value),
+        });
+        return el('label', { class: 'bgt-size-chip' }, input, label);
+    }
+
     function wheelActionRadio(value, label) {
         const input = el('input', {
             type: 'radio', name: 'bgt-wheelaction', value: value, checked: settings.wheelAction === value,
@@ -2640,6 +2662,22 @@
         const root = document.documentElement;
         root.style.setProperty('--bgt-tile-inline', s.inline);
         root.style.setProperty('--bgt-tile-full', s.full);
+    }
+
+    // Repoints every thumbnail already on screen rather than rebuilding the grid (which
+    // would re-fetch the feed as well). Tiles are loading="lazy", so only the ones you
+    // can actually see fetch again - the rest just carry the new URL until scrolled to.
+    function setThumbFormat(v) {
+        if (settings.thumbFormat === v) return;
+        settings.thumbFormat = v;
+        GM_setValue(THUMBFMT_KEY, v);
+        [gridEl, lbThumbs].forEach(root => {
+            if (!root) return;
+            root.querySelectorAll('img[data-keep-thumbnail]').forEach(img => {
+                const next = thumbUrl(img.getAttribute('src'));
+                if (next !== img.getAttribute('src')) img.setAttribute('src', next);
+            });
+        });
     }
 
     function setDebug(on) {
@@ -2789,6 +2827,11 @@
                 sizeChip('medium', 'Medium'),
                 sizeChip('large', 'Large')),
             el('div', { class: 'bgt-settings-hint' }, 'In-line columns: 5 · 4 · 3'),
+            el('div', { class: 'bgt-settings-label' }, 'Thumbnail format'),
+            el('div', { class: 'bgt-size-group' },
+                thumbFormatRadio('webp', 'WebP'),
+                thumbFormatRadio('jpeg', 'JPEG')),
+            el('div', { class: 'bgt-settings-hint' }, 'WebP is around 25% smaller for the same picture, across every tile in the grid. Switch to JPEG if dragging a tile out gives you a .webp file your image tools won’t open. Full-size images in the lightbox are unaffected.'),
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.tooltip, onChange: (e) => { setTooltip(e.target.checked); tooltipSub.style.display = e.target.checked ? 'block' : 'none'; } }),
                 el('span', {}, 'Enable gallery tooltip hover')),
