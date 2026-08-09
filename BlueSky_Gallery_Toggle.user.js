@@ -4,7 +4,7 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.13.0
+// @version      2.14.0
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky
 // @supportURL   https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/issues
@@ -104,6 +104,85 @@
     // Gated console logging - toggle via the settings modal (Debug logging).
     function logDebug(...args) {
         if (settings.debug) console.log('[Gallery Toggle]', ...args);
+    }
+
+    /* ======================================================================
+     * 0b. Handle -> DID cache (persisted).
+     *
+     *     A DID is permanent, so a resolved handle is worth keeping between
+     *     sessions. It doesn't save the getProfile call - the follow button needs
+     *     viewer state that can't be cached - but it saves *waiting* on it: with a
+     *     known DID the post fetch starts immediately rather than after the resolve.
+     *
+     *     The one thing that can go wrong is a handle changing hands, so this never
+     *     relies on the TTL alone: every successful getProfile rewrites the row it
+     *     touched, and a lookup that misses against a cached DID evicts it and
+     *     retries fresh. Stale rows heal themselves on first use.
+     * ==================================================================== */
+    const DIDCACHE_KEY = 'bsky-gallery-didcache';    // { handle(lowercase): [did, savedAtMs] }
+    const DIDCACHE_MAX = 500;                        // entries; least-recently-written evicted
+    const DIDCACHE_TTL = 90 * 24 * 3600 * 1000;      // 90 days
+    const DIDCACHE_REWRITE = 3600 * 1000;            // don't re-serialise a row fresher than this
+    let didCache = null;                             // lazily read from GM storage
+
+    function loadDidCache() {
+        if (didCache) return didCache;
+        try {
+            const raw = GM_getValue(DIDCACHE_KEY, null);
+            const obj = raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : {};
+            didCache = (obj && typeof obj === 'object' && !Array.isArray(obj)) ? obj : {};
+        } catch (e) { didCache = {}; } // unreadable/corrupt: start over rather than break
+        return didCache;
+    }
+
+    function saveDidCache() {
+        try { GM_setValue(DIDCACHE_KEY, JSON.stringify(didCache || {})); }
+        catch (e) { logDebug('DID cache save failed:', e); }
+    }
+
+    function didCacheSize() { return Object.keys(loadDidCache()).length; }
+
+    // The cached DID for a handle, or null. A row past the TTL is dropped and reported
+    // absent, so an entry for a handle we never look up can't linger indefinitely.
+    function cachedDid(handle) {
+        if (!handle || String(handle).indexOf('did:') === 0) return null;
+        const key = String(handle).toLowerCase();
+        const c = loadDidCache();
+        const row = c[key];
+        if (!Array.isArray(row) || !row[0]) return null;
+        if (Date.now() - (row[1] || 0) > DIDCACHE_TTL) { delete c[key]; saveDidCache(); return null; }
+        return row[0];
+    }
+
+    function rememberDid(handle, did) {
+        if (!handle || !did || String(handle).indexOf('did:') === 0) return;
+        const key = String(handle).toLowerCase();
+        const c = loadDidCache();
+        const row = c[key];
+        // Unchanged and recent: skip the write, so a browsing session doesn't
+        // re-serialise the whole blob on every profile it touches.
+        if (Array.isArray(row) && row[0] === did && Date.now() - (row[1] || 0) < DIDCACHE_REWRITE) return;
+        delete c[key];               // re-insert so key order tracks write recency
+        c[key] = [did, Date.now()];
+        const keys = Object.keys(c); // handles always contain a dot, so insertion order holds
+        for (let i = 0; i < keys.length - DIDCACHE_MAX; i++) delete c[keys[i]];
+        saveDidCache();
+    }
+
+    function forgetDid(handle) {
+        const key = String(handle || '').toLowerCase();
+        const c = loadDidCache();
+        if (!(key in c)) return false;
+        delete c[key];
+        saveDidCache();
+        return true;
+    }
+
+    function clearDidCache() {
+        const n = didCacheSize();
+        didCache = {};
+        saveDidCache();
+        return n;
     }
 
     // The page-realm fetch, captured before we patch it. We use this for our own
@@ -811,7 +890,14 @@
         const m = ref.match(/\/profile\/([^/]+)\/post\/([^/?#]+)/);
         if (!m) throw new Error('not a post URL or at:// uri: ' + ref);
         let did = decodeURIComponent(m[1]);
-        if (did.indexOf('did:') !== 0) did = (await xrpcGet('app.bsky.actor.getProfile', { actor: did })).did;
+        if (did.indexOf('did:') !== 0) {
+            const handle = did;
+            did = cachedDid(handle);
+            if (!did) {
+                did = (await xrpcGet('app.bsky.actor.getProfile', { actor: handle })).did;
+                rememberDid(handle, did);
+            }
+        }
         return 'at://' + did + '/app.bsky.feed.post/' + m[2];
     }
 
@@ -1154,6 +1240,11 @@
         profile.did = data.did || null;
         profile.handle = data.handle || null;
         profile.displayName = data.displayName || '';
+        // Authoritative resolve: refresh the cache under both the canonical handle and
+        // the spelling the URL used (they can differ in case), so ordinary browsing
+        // keeps rows for the accounts you actually visit current.
+        rememberDid(profile.handle, profile.did);
+        rememberDid(actor, profile.did);
         // Follow state: only an authed read carries a trustworthy viewer block; the
         // public fallback can't see follows, so never let it null out a known follow
         // (viewerKnown also gates the button - see updateFollowVisibility). And
@@ -2005,6 +2096,11 @@
         while (postCache.size > POST_CACHE_MAX) postCache.delete(postCache.keys().next().value);
     }
 
+    async function getPostByDid(did, rkey) {
+        const uri = 'at://' + did + '/app.bsky.feed.post/' + rkey;
+        return ((await xrpcGet('app.bsky.feed.getPosts', { uris: uri })).posts || [])[0] || null;
+    }
+
     async function openPostInViewer() {
         const r = currentPostRoute();
         if (!r || postMode.busy) return;
@@ -2024,14 +2120,29 @@
             let entry = postCache.get(r.key);
             if (entry) cachePost(r.key, entry); // cache hit: refresh its position
             else {
-                // getPosts needs an at:// uri, so a handle URL costs one resolve - which is
-                // the getProfile loadProfile is already making, so just wait on that.
-                let did = r.actor.indexOf('did:') === 0 ? r.actor : null;
+                // getPosts needs an at:// uri. A DID URL or a cached handle gives us one
+                // outright, so the post fetch runs alongside the getProfile above instead
+                // of behind it; otherwise we wait on that resolve.
+                let did = r.actor.indexOf('did:') === 0 ? r.actor : cachedDid(r.actor);
+                const fromCache = !!did && did !== r.actor;
                 if (!did) { await profileLoad; did = profile.did; }
                 if (!did) throw new Error('could not resolve @' + r.actor);
-                const uri = 'at://' + did + '/app.bsky.feed.post/' + r.rkey;
-                const post = ((await xrpcGet('app.bsky.feed.getPosts', { uris: uri })).posts || [])[0];
+
+                let post = await getPostByDid(did, r.rkey);
+                if (!post && fromCache) {
+                    // The cached DID's repo doesn't hold this rkey - most likely the handle
+                    // changed hands since we stored it. Fall back to the authoritative
+                    // resolve and try once more (never a loop: this one retry only).
+                    logDebug('post viewer: cached DID missed, re-resolving @' + r.actor);
+                    await profileLoad;
+                    // A successful resolve has already rewritten the cache row; only when it
+                    // couldn't resolve at all do we drop the stale row by hand. If the DID
+                    // matches what we used, the row was right and the post is simply gone.
+                    if (profile.did && profile.did !== did) post = await getPostByDid(profile.did, r.rkey);
+                    else if (!profile.did) forgetDid(r.actor);
+                }
                 if (!post) throw new Error('post not returned (deleted, blocked, or hidden from this session)');
+                rememberDid(post.author && post.author.handle, post.author && post.author.did);
                 grid.drops = []; // tilesFromPost records into this; keep it scoped to this post
                 entry = { items: viewerItemsFrom(post), aliases: actorAliases(r.actor, post.author) };
                 cachePost(r.key, entry);
@@ -2570,6 +2681,38 @@
                 el('input', { type: 'checkbox', checked: settings.ttReplies, onChange: (e) => setTooltipOpt('ttReplies', TTREPLIES_KEY, e.target.checked) }),
                 el('span', {}, 'Reply count')),
             el('div', { class: 'bgt-settings-hint' }, 'Each ticked item shows on its own line when you hover a thumbnail in the grid.'));
+        // Handle -> DID cache: live count + a two-step clear. The second click confirms
+        // (an inline arm/disarm rather than a native confirm(), which the page's own
+        // dialogs would sit oddly beside and which some setups suppress outright).
+        const didCount = el('span', { class: 'bgt-bitrate-unit' }, '');
+        const didBtn = el('button', { class: 'bgt-clear-btn', type: 'button' }, 'Clear');
+        let didArmed = null;
+        const paintDid = () => {
+            const n = didCacheSize();
+            didCount.textContent = n + (n === 1 ? ' handle cached' : ' handles cached');
+            didBtn.disabled = !n && !didArmed;
+        };
+        const disarmDid = () => {
+            if (didArmed) { clearTimeout(didArmed); didArmed = null; }
+            didBtn.classList.remove('bgt-armed');
+            didBtn.textContent = 'Clear';
+            paintDid();
+        };
+        didBtn.addEventListener('click', () => {
+            if (!didArmed) {
+                if (!didCacheSize()) return;
+                didBtn.textContent = 'Click again to confirm';
+                didBtn.classList.add('bgt-armed');
+                didArmed = setTimeout(disarmDid, 5000); // un-arm if they think better of it
+                return;
+            }
+            const n = clearDidCache();
+            logDebug('DID cache cleared (' + n + ' entries)');
+            disarmDid();
+            didBtn.textContent = 'Cleared';
+            setTimeout(() => { if (didBtn.isConnected) { didBtn.textContent = 'Clear'; paintDid(); } }, 1600);
+        });
+        paintDid();
         const card = el('div', { class: 'bgt-settings-card' },
             el('h2', {}, 'Gallery settings'),
             el('div', { class: 'bgt-settings-sub' }, 'How should the media grid appear?'),
@@ -2608,6 +2751,9 @@
                 el('input', { type: 'checkbox', checked: settings.tabHash, onChange: (e) => setTabHashSync(e.target.checked) }),
                 el('span', {}, 'Sync profile tab to URL hash')),
             el('div', { class: 'bgt-settings-hint' }, 'Reflects the open profile tab in the address bar (e.g. #media) and opens that tab when a link includes the hash — so other tools can deep-link straight to Media, Videos, Replies, etc.'),
+            el('div', { class: 'bgt-settings-label' }, 'Handle → DID cache'),
+            el('div', { class: 'bgt-bitrate-row' }, didBtn, didCount),
+            el('div', { class: 'bgt-settings-hint' }, 'Resolved handles are remembered for 90 days so opening a post skips waiting on the lookup. Entries refresh themselves as you browse, and a handle that has changed hands re-resolves on first use — clearing is only needed if something looks wrong.'),
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.debug, onChange: (e) => setDebug(e.target.checked) }),
                 el('span', {}, 'Debug logging to console')),
@@ -2982,6 +3128,16 @@
         }
         #${SETTINGS_ID} .bgt-num-input:focus { outline: none; border-color: #0085ff; }
         #${SETTINGS_ID} .bgt-bitrate-unit { font-size: 13px; color: #8b98a5; }
+        #${SETTINGS_ID} .bgt-clear-btn {
+            background: rgba(127,127,127,0.18); color: #f1f3f5; border: 1px solid #2a3743;
+            border-radius: 8px; padding: 8px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
+            font-family: inherit; transition: background-color 120ms ease, color 120ms ease;
+        }
+        #${SETTINGS_ID} .bgt-clear-btn:hover:not(:disabled) { background: rgba(127,127,127,0.3); }
+        #${SETTINGS_ID} .bgt-clear-btn:disabled { opacity: 0.45; cursor: default; }
+        /* Armed = one more click clears it; red so the second click is a deliberate one. */
+        #${SETTINGS_ID} .bgt-clear-btn.bgt-armed { background: rgba(244,33,46,0.16); color: #f4212e; border-color: rgba(244,33,46,0.5); }
+        #${SETTINGS_ID} .bgt-clear-btn.bgt-armed:hover { background: rgba(244,33,46,0.26); }
         #${SETTINGS_ID} .bgt-wheel-sub { margin: 6px 0 2px 4px; padding-left: 10px; border-left: 2px solid #2a3743; }
         #${SETTINGS_ID} .bgt-check-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 13px; color: #c3ccd6; cursor: pointer; }
         #${SETTINGS_ID} .bgt-check-row input { accent-color: #0085ff; }
