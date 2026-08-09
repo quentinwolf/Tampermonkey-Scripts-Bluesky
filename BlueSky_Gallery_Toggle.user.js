@@ -4,7 +4,7 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.14.0
+// @version      2.15.0
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky
 // @supportURL   https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/issues
@@ -656,7 +656,10 @@
     // Height of Bluesky's pinned profile tab bar (Posts/Replies/Media/Videos), so the
     // in-line header can stick just beneath it instead of overlapping it.
     function stickyTabBarHeight() {
-        const tablist = document.querySelector('[role="tablist"]');
+        // Scoped past any cached profile screen's tablist (see visibleProfileTabs), so we
+        // measure the bar our header actually has to sit under.
+        const lists = Array.from(document.querySelectorAll('[role="tablist"]'));
+        const tablist = (lists.length <= 1 ? lists[0] : lists.filter(isOnScreen)[0]) || null;
         if (tablist) {
             const h = Math.round(tablist.getBoundingClientRect().height);
             if (h > 8 && h < 200) return h;
@@ -2217,9 +2220,21 @@
     // The profile tabs are a pager: clicking Posts/Media/Videos does NOT change the
     // URL, so we read the active tab from the DOM. The selected tab's label holds an
     // underline element with an inline background-colour; inactive tabs leave it empty.
+    // Bluesky's navigator keeps previously-visited profile screens mounted, so a
+    // document-wide query for pager tabs can hand back the PREVIOUS profile's bar -
+    // still carrying whichever tab was selected there. Every tab read is scoped to the
+    // pager actually on screen, the same guard findInlineHost applies to the feed list.
+    // A lone pager is used as-is: there's nothing to disambiguate, and an odd zero-size
+    // measurement shouldn't blind us entirely.
+    function visibleProfileTabs() {
+        const all = Array.from(document.querySelectorAll(
+            '[data-testid^="profilePager-"]:not([data-testid^="profilePager-selector"])'));
+        if (all.length <= 1) return all;
+        return all.filter(isOnScreen);
+    }
+
     function activeProfileTab() {
-        const labels = document.querySelectorAll('[data-testid^="profilePager-"]:not([data-testid^="profilePager-selector"])');
-        for (const lab of labels) {
+        for (const lab of visibleProfileTabs()) {
             if (lab.querySelector('[style*="background-color"]')) {
                 return (lab.getAttribute('data-testid') || '').replace('profilePager-', '').toLowerCase();
             }
@@ -2261,8 +2276,7 @@
     const TAB_HASH_ALIAS = { video: 'videos', with_replies: 'replies' }; // accept the path-style spellings too
 
     function profileTabButtons() {
-        return Array.from(document.querySelectorAll(
-            '[data-testid^="profilePager-"]:not([data-testid^="profilePager-selector"])'));
+        return visibleProfileTabs(); // DOM order, so [0] is still the leftmost (default) tab
     }
     function tabNameOf(btn) {
         return (btn.getAttribute('data-testid') || '').replace('profilePager-', '').toLowerCase();
@@ -2285,14 +2299,18 @@
     // label is localised but the testid stays English).
     function profileTabCandidates() {
         const out = [];
-        const tablist = document.querySelector('[role="tablist"]');
+        // Scoped for the same reason as visibleProfileTabs: a cached profile screen's
+        // tablist is still in the document, and clicking it would do nothing at all -
+        // which would look exactly like a deep-link that silently refuses to apply.
+        const lists = Array.from(document.querySelectorAll('[role="tablist"]'));
+        const tablist = (lists.length <= 1 ? lists[0] : lists.filter(isOnScreen)[0]) || null;
         if (tablist) {
             tablist.querySelectorAll('[role="tab"]').forEach(t => {
                 const name = (t.getAttribute('aria-label') || t.textContent || '').trim().toLowerCase();
                 if (name) out.push({ el: t, name });
             });
         }
-        document.querySelectorAll('[data-testid^="profilePager-"]:not([data-testid^="profilePager-selector"])').forEach(p => {
+        visibleProfileTabs().forEach(p => {
             const name = (p.getAttribute('data-testid') || '').replace('profilePager-', '').toLowerCase();
             if (name) out.push({ el: p, name });
         });
@@ -2334,7 +2352,9 @@
 
     // pendingHash = a deep-link target we're still trying to click through to; actor
     // tracks the profile we're managing so a fresh hash is re-read on each new profile.
-    const tabSync = { actor: null, pendingHash: null, deadline: 0 };
+    // settleAt/lastActive gate the mirror-back: writing the hash is only safe once the
+    // pager reading has stopped moving (see phase 2).
+    const tabSync = { actor: null, pendingHash: null, deadline: 0, settleAt: 0, lastActive: null };
 
     function tickTabSync() {
         if (!settings.tabHash) return;
@@ -2352,6 +2372,9 @@
             bootHashUsed = true;
             tabSync.pendingHash = want || null;
             tabSync.deadline = Date.now() + 12000; // cold loads need longer for the pager to paint
+            // Entering a profile: nothing is mirrored back until the pager settles.
+            tabSync.settleAt = Date.now() + 700;
+            tabSync.lastActive = null;
         }
 
         const active = activeProfileTab();
@@ -2369,8 +2392,17 @@
             return; // don't mirror back while we're still applying
         }
 
-        // Phase 2 - mirror the active tab into the hash (default tab => clean URL).
-        if (active) setTabHash(active === defaultTabName() ? '' : active);
+        // Phase 2 - mirror the active tab into the hash (default tab => clean URL), but
+        // only once the reading has settled: for a frame or two after a profile switch
+        // the outgoing pager can still measure as on-screen, and mirroring that would
+        // stamp the previous profile's tab (#media) onto the new profile's URL. Requiring
+        // the same reading twice, no sooner than settleAt, costs a tick and no more.
+        if (!active) return;
+        if (Date.now() < tabSync.settleAt || active !== tabSync.lastActive) {
+            tabSync.lastActive = active;
+            return;
+        }
+        setTabHash(active === defaultTabName() ? '' : active);
     }
 
     // A typed hash, an in-page #anchor, or back/forward landing on a hash: queue it as
