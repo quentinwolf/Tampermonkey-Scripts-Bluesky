@@ -4,7 +4,7 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.19.0
+// @version      2.20.1
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky
 // @supportURL   https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/issues
@@ -47,6 +47,9 @@
     const TTREPOSTS_KEY = 'bsky-gallery-tt-reposts'; // boolean: repost count line in tooltip
     const TTREPLIES_KEY = 'bsky-gallery-tt-replies'; // boolean: reply count line in tooltip
     const TABHASH_KEY = 'bsky-gallery-tabhash';      // boolean: mirror profile tab <-> URL #hash
+    const HISTORY_KEY = 'bsky-gallery-history';      // boolean: back/forward walks the viewer
+    const HISTWHEEL_KEY = 'bsky-gallery-histwheel';  // boolean: wheel paging records history entries too
+    const IMGNUM_KEY = 'bsky-gallery-imgnum';        // boolean: append /N to a multi-image post's URL
     const PAGE_LIMIT = 100;                          // max getAuthorFeed page size
     const PUBLIC_API = 'https://public.api.bsky.app'; // unauthenticated fallback
     const ACCENT = '#4aa8ff';
@@ -103,6 +106,12 @@
         ttReposts: GM_getValue(TTREPOSTS_KEY, false),
         ttReplies: GM_getValue(TTREPLIES_KEY, false),
         tabHash: GM_getValue(TABHASH_KEY, true),
+        // Back/forward through the viewer. Wheel paging deliberately does NOT record
+        // entries by default - one flick would bury the back button under dozens of
+        // them - but it still keeps the address bar in step; histWheel opts into it.
+        history: GM_getValue(HISTORY_KEY, true),
+        histWheel: GM_getValue(HISTWHEEL_KEY, false),
+        imgNum: GM_getValue(IMGNUM_KEY, true),
     };
 
     // Gated console logging - toggle via the settings modal (Debug logging).
@@ -204,6 +213,40 @@
     // once by the tab-sync as the initial deep-link target.
     const bootHash = (location.hash || '').replace(/^#/, '').toLowerCase();
     let bootHashUsed = false;
+
+    // The native History.pushState, captured for the same reason as replaceState above:
+    // the viewer's own history entries must not re-enter our route handler.
+    const nativePushState = unsafeWindow.history.pushState;
+
+    // A post path, with the viewer's optional 1-based image number on the end
+    //   /profile/<actor>/post/<rkey>          -> single image, video, or "image 1"
+    //   /profile/<actor>/post/<rkey>/3        -> the 3rd image of a multi-image post
+    // The rkey group can't cross a slash, so the trailing number is never ambiguous.
+    const POST_PATH_RE = /^\/profile\/([^/]+)\/post\/([^/?#]+)(?:\/(\d{1,2}))?\/?$/;
+
+    // A pasted or bookmarked per-image URL carries a path segment Bluesky's router has
+    // no route for - it would render the not-found screen. Strip it back to the plain
+    // post URL here at document-start, before the router hydrates, and keep the number
+    // as a deep-link target for the viewer. Same trick, same reason, as bootHash above.
+    let bootImgIndex = 0, bootImgKey = null;
+    (function captureBootImage() {
+        const m = location.pathname.match(POST_PATH_RE);
+        if (!m || !m[3]) return;
+        const n = Number(m[3]);
+        if (!(n > 0)) return;
+        try {
+            nativeReplaceState.call(unsafeWindow.history, unsafeWindow.history.state, '',
+                '/profile/' + m[1] + '/post/' + m[2] + location.search + location.hash);
+            bootImgIndex = n;
+            bootImgKey = decodeURIComponent(m[1]).toLowerCase() + '/' + m[2];
+        } catch (_) { /* blocked: leave the URL alone and let Bluesky show what it will */ }
+    })();
+
+    // Back/forward for the viewer. Registered HERE, at document-start, and deliberately
+    // not in startDom(): popstate is dispatched at `window`, where listeners run in
+    // registration order, so being first is the only way to get ahead of Bluesky's own
+    // router (and of our onRouteChange hook) and stop the event when the entry is ours.
+    unsafeWindow.addEventListener('popstate', onBgtPopState);
 
     /* ======================================================================
      * 1. Borrow the logged-in session straight off the app's own requests.
@@ -405,13 +448,19 @@
         if (type === 'app.bsky.embed.images#view' && Array.isArray(embed.images)) {
             const ps = postStateFrom(post); // shared across this post's image tiles
             declared = embed.images.length;
-            embed.images.forEach(img => {
+            embed.images.forEach((img, i) => {
                 tiles.push({
                     kind: 'image',
                     thumb: img.thumb,
                     full: img.fullsize,   // bare CDN URL (no @format): the CDN negotiates webp
                     alt: img.alt || '',
                     url: postUrl(post),
+                    // Position in the POST's own image list, 1-based - stamped here rather
+                    // than derived from tile order later, so an item we skip (see the
+                    // gallery branch) can't silently shift the numbering that the
+                    // per-image URL advertises to whatever consumes it.
+                    imgIndex: i + 1,
+                    imgCount: declared,
                     postState: ps,
                 });
             });
@@ -423,7 +472,7 @@
             // tile. viewImage uses `thumbnail` where images#view uses `thumb`.
             const ps = postStateFrom(post); // shared across this post's image tiles
             declared = embed.items.length;
-            embed.items.forEach(item => {
+            embed.items.forEach((item, i) => {
                 if (item.$type !== 'app.bsky.embed.gallery#viewImage') return;
                 tiles.push({
                     kind: 'image',
@@ -431,6 +480,8 @@
                     full: item.fullsize,
                     alt: item.alt || '',
                     url: postUrl(post),
+                    imgIndex: i + 1,   // record position, not tile position (see above)
+                    imgCount: declared,
                     postState: ps,
                 });
             });
@@ -479,6 +530,18 @@
         // genuine repeat of the same post, which is what feed pagination can hand us.
         tiles.forEach((t, i) => { t._postIdx = i; t._postDeclared = declared; t._key = post.uri + '#' + i; });
         return tiles;
+    }
+
+    // The viewer's item shape, projected from a grid tile. Both paths that fill
+    // grid.items - the gallery grid (appendTiles) and the single-post viewer
+    // (viewerItemsFrom) - build through here, so a field the lightbox needs can't be
+    // carried by one and quietly dropped by the other.
+    function viewerItemFrom(t) {
+        return {
+            kind: t.kind, full: t.full, thumb: t.thumb, alt: t.alt, url: t.url,
+            playlist: t.playlist, aspectRatio: t.aspectRatio, postState: t.postState,
+            imgIndex: t.imgIndex, imgCount: t.imgCount,
+        };
     }
 
     /* ======================================================================
@@ -827,10 +890,7 @@
             // lightbox; GIF/external embeds have no playlist, so they stay click-to-post.
             if (t.kind === 'image' || (t.kind === 'video' && t.playlist)) {
                 t._lbIndex = grid.items.length;
-                grid.items.push({
-                    kind: t.kind, full: t.full, thumb: t.thumb, alt: t.alt, url: t.url,
-                    playlist: t.playlist, aspectRatio: t.aspectRatio, postState: t.postState,
-                });
+                grid.items.push(viewerItemFrom(t));
             }
             frag.appendChild(makeTile(t));
         });
@@ -1402,7 +1462,15 @@
     let lbReturnUrl = null;  // address-bar URL to restore when the lightbox closes
     let lbAppliedUrl = null; // the post URL we last wrote to the bar (detects a real navigation)
     let lbUrlTimer = null;   // debounce so fast paging doesn't spam history.replaceState
+    let lbUrlPush = false;   // does the pending debounced write deserve a history entry of its own?
+    let lbNavMode = 'push';  // how the NEXT showLightbox() records itself: 'push' | 'replace' | 'none'
+    let lbHistUnwinding = 0; // closing via history.go(): timestamp we're waiting on the popstate from
     let lbPrevFocus = null;  // element focused before the lightbox opened (restored on close)
+    // One run of viewer history entries. `depth` counts the entries pushed above the one
+    // the viewer was opened from - what close() unwinds in a single go(-n). The token is
+    // minted per page load so entries that outlive a reload read as "not ours".
+    const BGT_TOK = Math.random().toString(36).slice(2, 10);
+    const lbHist = { depth: 0, baseUrl: null, post: false };
 
     // Build one action button. `withCount` adds a live counter; like/bookmark pass a
     // second path so the icon can swap to its filled variant when active.
@@ -1627,7 +1695,7 @@
             if (lbImg.complete && lbImg.naturalWidth > 0) { lbImg.classList.add('bgt-loaded'); hideLbLoading(); }
         }
         lbLink.href = it.url;
-        lbSyncUrlSoon(it.url); // mirror this post into the address bar (debounced)
+        lbRecordUrl(); // mirror this image into the address bar + history (debounced)
         updateNavButtons();
         updateActionBar();
         applyPostInfo();
@@ -1933,47 +2001,214 @@
         } catch (_) { /* blocked / cross-origin: just leave the bar as-is */ }
     }
 
+    /* ---- viewer history: back / forward walk the images ------------------------
+     * Every deliberate move - opening the viewer, the chevrons, arrow keys, a
+     * thumbnail - pushes one entry; wheel paging only rewrites the top entry unless
+     * settings.histWheel says otherwise. Entries carry a `bgt` block inside
+     * history.state, added alongside whatever Bluesky's router already put there
+     * (copied forward untouched), naming the post + image to restore and the depth
+     * that lets close() unwind the whole run in one hop.
+     * -------------------------------------------------------------------------- */
+    function lbHistOn() { return !!settings.history; }
+    function lbIsOpen() { return !!lbEl && lbEl.style.display !== 'none'; }
+
+    // Whether the run our entries belong to can still be restored. removeOverlay() leaves
+    // grid.items in place, so "we have items" isn't enough on its own: a gallery run needs
+    // its overlay still mounted, while a single-post run only needs the post's items,
+    // which deliberately outlive the teardown that follows closing the viewer there.
+    // Entries that fail this are handed back to Bluesky's router untouched - which is what
+    // makes Back still work normally after you've moved on to another profile.
+    function lbHistLive() {
+        return !!grid.items.length && (!!rootEl || lbHist.post);
+    }
+
+    // The address-bar URL for an item: the post URL, plus /N for one image out of
+    // several. Deliberately separate from `it.url` - the Open-post link, the tile href
+    // and the right-click copy target all keep pointing at the clean post URL.
+    function lbBarUrl(it) {
+        if (!it) return location.href;
+        if (!settings.imgNum || !it.imgIndex || (it.imgCount || 0) < 2) return it.url;
+        return it.url.replace(/\/+$/, '') + '/' + it.imgIndex;
+    }
+
+    function bgtState(depth, it) {
+        const cur = unsafeWindow.history.state;
+        const base = (cur && typeof cur === 'object') ? cur : {};
+        return Object.assign({}, base, {
+            bgt: {
+                v: 1, tok: BGT_TOK, d: depth,
+                post: it ? it.url : null,
+                n: (it && it.imgIndex) || 0,
+                i: it ? lbIndex : -1,
+            },
+        });
+    }
+
+    function bgtStateOf(s) {
+        const b = (s && typeof s === 'object') ? s.bgt : null;
+        return (b && b.v === 1 && b.tok === BGT_TOK) ? b : null;
+    }
+
+    // grid.items is renumbered by infinite scroll and rebuilt from scratch on a remount,
+    // so the recorded index is only a hint: trust it while it still lands on the same
+    // post + image, otherwise scan. -1 means that gallery is gone.
+    function lbResolveState(b) {
+        const items = grid.items;
+        const hit = (it) => !!it && it.url === b.post && (!b.n || it.imgIndex === b.n);
+        if (b.i != null && b.i >= 0 && hit(items[b.i])) return b.i;
+        for (let i = 0; i < items.length; i++) if (hit(items[i])) return i;
+        return -1;
+    }
+
+    // Stamp the entry the viewer is opening from as the floor of this run, so the
+    // popstate that lands back on it is recognisable as ours - as opposed to the user
+    // backing out past it into Bluesky's own history, which we must not swallow.
+    function lbHistBegin() {
+        lbHist.depth = 0;
+        lbHist.baseUrl = location.href;
+        lbHist.post = postMode.active;
+        if (!lbHistOn()) return;
+        try { nativeReplaceState.call(unsafeWindow.history, bgtState(0, null), '', location.href); }
+        catch (_) { /* ignore */ }
+    }
+
+    // One address-bar write. `push` adds a history entry; otherwise the top entry is
+    // rewritten in place - which still restamps the state, or back/forward would restore
+    // whichever image that entry happened to be created on.
+    function lbWriteUrl(url, push) {
+        const on = lbHistOn();
+        const st = on ? bgtState(lbHist.depth + (push ? 1 : 0), grid.items[lbIndex])
+                      : unsafeWindow.history.state;
+        try {
+            if (push && on) {
+                nativePushState.call(unsafeWindow.history, st, '', url);
+                lbHist.depth += 1;
+            } else {
+                nativeReplaceState.call(unsafeWindow.history, st, '', url);
+            }
+        } catch (_) {
+            // Browsers rate-limit these (Safari throws past ~100 pushes / 30s). Dropping a
+            // history entry is survivable; dropping the address bar isn't, so fall back.
+            try { nativeReplaceState.call(unsafeWindow.history, unsafeWindow.history.state, '', url); }
+            catch (__) { return; } // blocked outright: leave the bar as it is
+        }
+        lastSig = routeSig();
+    }
+
     // Debounced address-bar sync for navigation: rapid wheel/arrow paging only writes the
     // URL once you settle on an image, which also stays clear of browsers' replaceState
     // rate limits (Safari throws past ~100 calls / 30s).
-    function lbSyncUrlSoon(url) {
+    function lbSyncUrlSoon(url, push) {
         if (lbUrlTimer) clearTimeout(lbUrlTimer);
+        // A pending push outranks a replace landing on top of it: the deliberate move that
+        // earned the entry still gets one, it just records wherever you settled.
+        lbUrlPush = lbUrlPush || !!push;
         lbUrlTimer = setTimeout(() => {
             lbUrlTimer = null;
-            lbSetUrl(url);
+            const p = lbUrlPush; lbUrlPush = false;
+            lbWriteUrl(url, p);
             lbAppliedUrl = location.href;
         }, 200);
     }
 
-    function openLightbox(i) {
+    // Runs at the end of every showLightbox(). lbNavMode is a one-shot set by whoever
+    // moved us here, and always falls back to 'push' so a future navigation path that
+    // forgets to set it records an entry rather than quietly losing one.
+    function lbRecordUrl() {
+        const mode = lbNavMode;
+        lbNavMode = 'push';
+        if (mode === 'none') return; // restoring from history: the bar is already correct
+        lbSyncUrlSoon(lbBarUrl(grid.items[lbIndex]), mode === 'push');
+    }
+
+    // Back / forward landed somewhere. Registered at document-start (see above) so this
+    // runs before Bluesky's router and before our own onRouteChange, which is what lets
+    // an entry that belongs to us be handled here and stopped before either sees it.
+    function onBgtPopState(e) {
+        if (!lbHistOn()) return;
+        const b = bgtStateOf(unsafeWindow.history.state);
+        const open = lbIsOpen();
+
+        // Outside our run: Bluesky's own history, a marker left over from a previous page
+        // load, or a run whose gallery is gone. Close the viewer if it is open, but let the
+        // event through - that entry is the router's to act on now.
+        if (!b || !lbHistLive()) { if (open) lbClosePlain(); return; }
+
+        if (lbUrlTimer) { clearTimeout(lbUrlTimer); lbUrlTimer = null; lbUrlPush = false; }
+
+        // Depth 0 is the entry the viewer was opened from. The router never saw our pushes
+        // (nativePushState), so its own state still matches this entry - letting the event
+        // through would only make it re-route to where it already is.
+        if (!b.d) {
+            e.stopImmediatePropagation();
+            lbHist.depth = 0;
+            lbHistUnwinding = 0;
+            if (open) lbClosePlain();
+            lastSig = routeSig();
+            return;
+        }
+
+        // An image entry. If the gallery it belonged to is gone - a profile switch, a
+        // remount - fall through to the router rather than showing the wrong picture.
+        const idx = lbResolveState(b);
+        if (idx < 0) { if (open) lbClosePlain(); return; }
+
+        e.stopImmediatePropagation();
+        lbHist.depth = b.d;
+        lbHistUnwinding = 0;
+        lbIndex = idx;
+        lbNavMode = 'none';
+        if (open) showLightbox(); else lbOpenAt(idx, 'none');
+        lbAppliedUrl = location.href;
+        lastSig = routeSig();
+    }
+
+    // Put the viewer on screen at `i`. `mode` is how that move records itself:
+    // 'push' for a deliberate open, 'none' when back/forward is restoring an entry that
+    // already exists (writing anything then would fight the history we just moved to).
+    function lbOpenAt(i, mode) {
         if (!lbEl) buildLightbox();
-        lbReturnUrl = location.href; // remember the gallery URL to restore on close
+        // Set on a fresh open; re-entering a run from history inherits the run's floor.
+        if (lbReturnUrl == null) lbReturnUrl = lbHist.baseUrl || location.href;
+        // A run that began on a post page needs its route hold back, or the route poller
+        // would read the /post/ URL as "not a gallery" and tear the reopened viewer down.
+        if (lbHist.post) postMode.active = true;
         lbPrevFocus = document.activeElement; // hand focus back here on close
         lbLastDir = 1; // fresh open: bias the buffer forward
         lbIndex = i;
+        lbNavMode = mode || 'push';
         showLightbox();
         lbEl.style.display = 'flex';
         lbEl.focus({ preventScroll: true }); // move keyboard/AT focus into the dialog
         unsafeWindow.addEventListener('keydown', lbKeyHandler, true);
     }
 
-    function navLightbox(d) {
+    function openLightbox(i) {
+        if (!lbEl) buildLightbox();
+        lbReturnUrl = location.href; // remember the gallery URL to restore on close
+        lbHistBegin();               // and mark it as the floor of this run of entries
+        lbOpenAt(i, 'push');
+    }
+
+    function navLightbox(d, mode) {
         const [lo, hi] = navBounds();
         const n = lbIndex + d;
         if (n < lo || n > hi) return; // off the end of the gallery, or of the post group
         lbLastDir = d < 0 ? -1 : 1;   // bias the prefetch buffer toward the way we're moving
         lbIndex = n;
+        lbNavMode = mode || 'push';   // deliberate moves get their own history entry
         showLightbox();               // showLightbox tops up the page + prefetch buffer near the end
     }
 
     // Step strictly within the current post's image group, regardless of the
     // continuous-nav setting (used by the thumbnail-strip wheel).
-    function navWithinPost(d) {
+    function navWithinPost(d, mode) {
         const [lo, hi] = postGroupRange(lbIndex);
         const n = lbIndex + d;
         if (n < lo || n > hi) return;
         lbLastDir = d < 0 ? -1 : 1;
         lbIndex = n;
+        lbNavMode = mode || 'push';
         showLightbox();
     }
 
@@ -2056,11 +2291,43 @@
         wheelDir = dir;
         if (!newNotch && (now - wheelLastStep) < 180) return;
         wheelLastStep = now;
-        if (mode === 'thumbs') navWithinPost(dir); else navLightbox(dir);
+        // Wheel paging rewrites the top entry instead of adding one: a single flick
+        // would otherwise bury the back button under dozens of images. settings.histWheel
+        // opts back in for anyone who wants every notch recorded.
+        const hm = settings.histWheel ? 'push' : 'replace';
+        if (mode === 'thumbs') navWithinPost(dir, hm); else navLightbox(dir, hm);
     }
 
+    // User-facing close (Esc, the X, a backdrop click). When our own entries are on top
+    // of the stack, close by rewinding them rather than by hiding the dialog: the popstate
+    // that lands back on the entry the viewer was opened from does the actual closing.
+    // Going back N in one hop leaves all N on the forward stack, so Forward re-opens on
+    // the image you left off at, and one more Back leaves the page as it normally would.
     function closeLightbox() {
         if (!lbEl) return;
+        if (lbHistOn() && lbHist.depth > 0 && !lbHistUnwinding) {
+            lbHistUnwinding = Date.now();
+            try {
+                unsafeWindow.history.go(-lbHist.depth);
+                // history.go() is async. If the popstate never arrives - blocked, or a
+                // browser that skipped our entries - close by hand instead of hanging open.
+                setTimeout(() => {
+                    if (lbHistUnwinding && lbIsOpen()) { lbHistUnwinding = 0; lbClosePlain(); }
+                }, 600);
+                return;
+            } catch (_) { lbHistUnwinding = 0; }
+        }
+        lbClosePlain();
+    }
+
+    // Hide and tear the viewer down where it stands, touching no history. Used by the
+    // rewind above once it lands, and by removeOverlay - a route change or a gallery
+    // teardown must never rewind the history the user is already navigating.
+    function lbClosePlain() {
+        if (!lbEl) return;
+        lbHistUnwinding = 0;
+        lbHist.depth = 0;   // baseUrl/post survive: back INTO this run has to reopen it
+        lbNavMode = 'push';
         teardownVideo();
         lbEl.style.display = 'none';
         lbImg.onload = lbImg.onerror = null; // detach first: clearing src fires `error`
@@ -2073,7 +2340,7 @@
         lbPrevFocus = null;
         // Put the gallery's own URL back - but only if the bar still holds the post URL we
         // set; if the user navigated/hit back, leave that alone. Cancel any pending sync first.
-        if (lbUrlTimer) { clearTimeout(lbUrlTimer); lbUrlTimer = null; }
+        if (lbUrlTimer) { clearTimeout(lbUrlTimer); lbUrlTimer = null; lbUrlPush = false; }
         if (lbReturnUrl != null && location.href === lbAppliedUrl) lbSetUrl(lbReturnUrl);
         lbReturnUrl = lbAppliedUrl = null;
         // The single-post viewer only lives as long as its lightbox; releasing the flag
@@ -2098,15 +2365,19 @@
     const POST_CACHE_MAX = 10;
     const postCache = new Map();  // '<actor>/<rkey>' -> { items, aliases } for one post
     // rkey + aliases identify the post the open viewer belongs to; busy guards double-clicks
-    // while the fetch is in flight. Cleared by closeLightbox.
+    // while the fetch is in flight. Cleared by lbClosePlain.
     const postMode = { active: false, rkey: null, aliases: null, busy: false };
     let postBtnKey = null;        // post the nav button's current state refers to
 
     function currentPostRoute() {
-        const m = location.pathname.match(/^\/profile\/([^/]+)\/post\/([^/?#]+)\/?$/);
+        const m = location.pathname.match(POST_PATH_RE);
         if (!m) return null;
         const actor = decodeURIComponent(m[1]);
-        return { actor: actor, rkey: m[2], key: actor.toLowerCase() + '/' + m[2] };
+        // `img` is the viewer's own /N suffix. Matching it matters well beyond deep
+        // links: the lightbox writes those URLs as it pages, and postViewerHolding()
+        // reads this route - if /post/<rkey>/3 stopped matching, the route poller would
+        // decide we had left the post and close the viewer mid-browse.
+        return { actor: actor, rkey: m[2], key: actor.toLowerCase() + '/' + m[2], img: Number(m[3]) || 0 };
     }
 
     // True while the viewer is open on the post it was opened from. The lightbox mirrors
@@ -2134,10 +2405,7 @@
     function viewerItemsFrom(post) {
         return tilesFromPost(post)
             .filter(t => t.kind === 'image' || (t.kind === 'video' && t.playlist))
-            .map(t => ({
-                kind: t.kind, full: t.full, thumb: t.thumb, alt: t.alt, url: t.url,
-                playlist: t.playlist, aspectRatio: t.aspectRatio, postState: t.postState,
-            }));
+            .map(viewerItemFrom);
     }
 
     function cachePost(key, entry) {
@@ -2221,7 +2489,7 @@
             postMode.aliases = entry.aliases;
             setPostBtn('idle');
             logDebug('post viewer: ' + entry.items.length + ' item(s) from ' + r.key);
-            openLightbox(0);
+            openLightbox(startIndexFor(r, entry.items));
         } catch (e) {
             console.error('[Gallery Toggle] post viewer failed' + staleHint() + ':', e);
             setPostBtn('none', 'Could not load this post (' + (e && e.message ? e.message : 'error') + ')');
@@ -2229,6 +2497,38 @@
         } finally {
             postMode.busy = false;
         }
+    }
+
+    // Where a freshly opened post viewer should land: the image a /N URL named, else the
+    // first item. The boot value is consumed once - document-start already stripped the
+    // segment off the address bar, so it can't be re-read from the URL afterwards.
+    function startIndexFor(r, items) {
+        let want = r.img;
+        if (!want && bootImgKey === r.key) want = bootImgIndex;
+        if (bootImgKey === r.key) { bootImgKey = null; bootImgIndex = 0; }
+        if (!want) return 0;
+        const k = items.findIndex(it => it.imgIndex === want);
+        if (k < 0) logDebug('post viewer: no image ' + want + ' in ' + r.key + ', opening at the first');
+        return k < 0 ? 0 : k;
+    }
+
+    // A pasted /profile/<actor>/post/<rkey>/N link opens the viewer on that image by
+    // itself, no click needed. Retried each tick because a cold load needs the route (and
+    // ideally the borrowed token) to settle first, then abandoned so it can't fire late.
+    const postDeepLink = { deadline: 0, fired: false };
+    function tickPostDeepLink() {
+        if (!bootImgKey || postDeepLink.fired) return;
+        if (!postDeepLink.deadline) postDeepLink.deadline = Date.now() + 15000;
+        if (Date.now() > postDeepLink.deadline) { bootImgKey = null; bootImgIndex = 0; return; }
+        const r = currentPostRoute();
+        if (!r || r.key !== bootImgKey || postMode.busy || lbIsOpen()) return;
+        // Give the app a moment to make its first authed XRPC call so we can borrow the
+        // token, or a deep link into moderated media would resolve against the public API
+        // and come back empty. Past that grace we go ahead with whatever we have.
+        if (!auth.headers && Date.now() < postDeepLink.deadline - 12000) return;
+        postDeepLink.fired = true;
+        logDebug('post deep link: opening image ' + bootImgIndex + ' of ' + bootImgKey);
+        openPostInViewer();
     }
 
     function postBtnEl() {
@@ -2572,7 +2872,7 @@
         if (inlineResizeHandler) { window.removeEventListener('resize', inlineResizeHandler); inlineResizeHandler = null; }
         if (inlineScrollHandler) { window.removeEventListener('scroll', inlineScrollHandler, true); inlineScrollHandler = null; }
         pendingHeader = null;
-        closeLightbox();
+        lbClosePlain(); // a teardown, not a user close: never rewind the history here
         if (lbEl) { lbEl.remove(); lbEl = null; lbFollowBtn = lbHandleLink = null; }
         if (io) { io.disconnect(); io = null; }
         if (overlayKeyHandler) { document.removeEventListener('keydown', overlayKeyHandler); overlayKeyHandler = null; }
@@ -2743,6 +3043,26 @@
         if (lbEl && lbEl.style.display !== 'none') updateNavButtons(); // live: refresh the arrows
     }
 
+    function setHistoryNav(on) {
+        settings.history = !!on;
+        GM_setValue(HISTORY_KEY, settings.history);
+        // Turning it off mid-run would strand entries nothing will ever claim; drop the
+        // depth so the next close hides the viewer instead of rewinding into them.
+        if (!settings.history) { lbHist.depth = 0; lbHistUnwinding = 0; }
+    }
+
+    function setHistWheel(on) {
+        settings.histWheel = !!on;
+        GM_setValue(HISTWHEEL_KEY, settings.histWheel);
+    }
+
+    function setImgNum(on) {
+        settings.imgNum = !!on;
+        GM_setValue(IMGNUM_KEY, settings.imgNum);
+        // Live: rewrite the bar for the image on screen so the change is visible at once.
+        if (lbIsOpen() && grid.items[lbIndex]) lbSyncUrlSoon(lbBarUrl(grid.items[lbIndex]), false);
+    }
+
     function setWheel(on) {
         settings.wheel = !!on;
         GM_setValue(WHEEL_KEY, settings.wheel);
@@ -2804,6 +3124,9 @@
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.wheelReverse, onChange: (e) => setWheelReverse(e.target.checked) }),
                 el('span', {}, 'Reverse wheel direction')),
+            el('label', { class: 'bgt-check-row' },
+                el('input', { type: 'checkbox', checked: settings.histWheel, onChange: (e) => setHistWheel(e.target.checked) }),
+                el('span', {}, 'Log wheel navigation to history')),
             el('div', { class: 'bgt-settings-hint' }, 'Scroll the thumbnail strip to flip within a post; over the image the wheel does the action chosen above.'));
         // Tooltip sub-options, revealed in place by the master checkbox below (same
         // pattern as the wheel block). Each ticked line shows on its own row in the
@@ -2893,6 +3216,14 @@
                 el('input', { type: 'checkbox', checked: settings.continuousNav, onChange: (e) => setContinuousNav(e.target.checked) }),
                 el('span', {}, 'Continuous navigation across posts')),
             el('div', { class: 'bgt-settings-hint' }, 'On: arrows flow through every image. Off: arrows stay within a post’s images — use the thumbnail strip (shown for 2–4 image posts) to jump between them.'),
+            el('label', { class: 'bgt-check-row' },
+                el('input', { type: 'checkbox', checked: settings.history, onChange: (e) => setHistoryNav(e.target.checked) }),
+                el('span', {}, 'Back/forward buttons navigate the viewer')),
+            el('div', { class: 'bgt-settings-hint' }, 'Each image you open gets a history entry, so Back steps to the one before it and Back from the first closes the viewer. Forward retraces — including re-opening the viewer on the image you closed it at. Wheel paging is excluded unless you tick it under the wheel options.'),
+            el('label', { class: 'bgt-check-row' },
+                el('input', { type: 'checkbox', checked: settings.imgNum, onChange: (e) => setImgNum(e.target.checked) }),
+                el('span', {}, 'Append image number to post URLs')),
+            el('div', { class: 'bgt-settings-hint' }, 'On a multi-image post the address bar reads …/post/<rkey>/2 for the second image, so the URL you copy points at the picture you are looking at. Pasting one back opens the viewer on that image. Single-image posts and videos are left as the plain post URL.'),
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.wheel, onChange: (e) => { setWheel(e.target.checked); wheelSub.style.display = e.target.checked ? 'block' : 'none'; } }),
                 el('span', {}, 'Enable mouse-wheel features')),
@@ -3415,9 +3746,11 @@
             // change; remount it.
             else if (galleryEnabled && rootEl && !rootEl.isConnected) syncGallery();
             tickTabSync();
+            tickPostDeepLink();
         }, 500);
 
         tickTabSync(); // apply any hash present on first paint
+        tickPostDeepLink();
         syncGallery();
     }
 
