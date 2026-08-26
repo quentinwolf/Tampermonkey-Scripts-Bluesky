@@ -4,7 +4,7 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.20.1
+// @version      2.21.0
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky
 // @supportURL   https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/issues
@@ -50,6 +50,7 @@
     const HISTORY_KEY = 'bsky-gallery-history';      // boolean: back/forward walks the viewer
     const HISTWHEEL_KEY = 'bsky-gallery-histwheel';  // boolean: wheel paging records history entries too
     const IMGNUM_KEY = 'bsky-gallery-imgnum';        // boolean: append /N to a multi-image post's URL
+    const RESINFO_KEY = 'bsky-gallery-resinfo';      // boolean: pixel-size badge over the lightbox media
     const PAGE_LIMIT = 100;                          // max getAuthorFeed page size
     const PUBLIC_API = 'https://public.api.bsky.app'; // unauthenticated fallback
     const ACCENT = '#4aa8ff';
@@ -112,6 +113,7 @@
         history: GM_getValue(HISTORY_KEY, true),
         histWheel: GM_getValue(HISTWHEEL_KEY, false),
         imgNum: GM_getValue(IMGNUM_KEY, true),
+        resInfo: GM_getValue(RESINFO_KEY, false),
     };
 
     // Gated console logging - toggle via the settings modal (Debug logging).
@@ -1456,6 +1458,7 @@
     let lbActionsRow, lbReply, lbRepost, lbLike, lbBookmark, lbPostText, lbTime, lbThumbs;
     let lbFollowBtn = null, lbHandleLink = null; // top-corner identity + follow (shares profile state)
     let lbLoading, lbLoadingSpin, lbLoadingText; // "Loading media…" overlay while an image decodes
+    let lbStage = null, lbRes = null;            // stage band + the pixel-size badge pinned to the media
     let thumbsRange = null; // [lo,hi] of items currently rendered in the thumbnail strip
     let lbLastDir = 1;            // last lightbox nav direction (+1 next / -1 prev), to bias prefetch
     const lbPrefetch = new Map(); // url -> Image: bounded buffer of warmed upcoming full-size images
@@ -1537,7 +1540,11 @@
         lbVideo.addEventListener('loadedmetadata', () => {
             if (lbVideo.videoWidth && lbVideo.videoHeight)
                 lbVideo.style.setProperty('--bgt-ar', lbVideo.videoWidth + ' / ' + lbVideo.videoHeight);
+            updateResBadge();
         });
+        // hls.js walks the ABR ladder after playback starts, so the rendition on screen
+        // can change size mid-video - repaint the badge whenever it does.
+        lbVideo.addEventListener('resize', updateResBadge);
         lbCap = el('div', { class: 'bgt-lb-cap' });
         lbPostText = el('div', { class: 'bgt-lb-text' });
         lbLink = el('a', { class: 'bgt-lb-post', target: '_blank', rel: 'noopener' }, 'Open post ↗');
@@ -1584,6 +1591,11 @@
         lbLoadingText = el('div', { class: 'bgt-lb-loading-text' }, 'Loading media…');
         lbLoading = el('div', { class: 'bgt-lb-loading' }, lbLoadingSpin, lbLoadingText);
 
+        // Pixel-size badge (opt-in). It lives in the stage rather than in the lightbox
+        // corner so it can be pinned to the *media's* top-right edge - which moves with
+        // every image's shape - instead of floating in the letterbox beside a portrait.
+        lbRes = el('div', { class: 'bgt-lb-res' });
+
         // Close on a click that lands on the backdrop OR the stage's empty letterbox
         // area (there e.target is the stage div itself). The image/video are child
         // elements, so a click on them targets the media - never the stage - which keeps
@@ -1597,7 +1609,7 @@
                 const t = e.target;
                 if (t === lbEl || (t.classList && t.classList.contains('bgt-lb-stage'))) closeLightbox();
             },
-        }, close, gear, lbTop, lbThumbs, lbPrev, el('div', { class: 'bgt-lb-stage' }, lbImg, lbVideo, lbLoading), lbNext, bar);
+        }, close, gear, lbTop, lbThumbs, lbPrev, (lbStage = el('div', { class: 'bgt-lb-stage' }, lbImg, lbVideo, lbRes, lbLoading)), lbNext, bar);
         document.body.appendChild(lbEl);
         // Seed the freshly built top-corner controls from the current profile state.
         updateHeaderIdentity();
@@ -1609,6 +1621,9 @@
         // false lets us stop the page behind the lightbox from scrolling.
         lbEl.addEventListener('wheel', lbWheel, { passive: false });
         lbImg.addEventListener('mousemove', lbImgPan);
+        // The badge is pinned to the media's edges, which move when the stage resizes.
+        // Cheap and gated on the viewer being open, so it costs nothing when it isn't.
+        window.addEventListener('resize', () => { if (lbIsOpen()) positionResBadge(); });
 
         // stopImmediatePropagation + window-capture so we win over Bluesky's own
         // arrow-key shortcuts (which listen on document and would otherwise eat them).
@@ -1689,7 +1704,7 @@
             // it; a cached image is already complete, so we reveal instantly (no flash).
             lbImg.classList.remove('bgt-loaded');
             showLbLoading();
-            lbImg.onload = () => { lbImg.classList.add('bgt-loaded'); hideLbLoading(); };
+            lbImg.onload = () => { lbImg.classList.add('bgt-loaded'); hideLbLoading(); updateResBadge(); };
             lbImg.onerror = () => lbLoadError();
             lbImg.src = fullUrl(it);
             if (lbImg.complete && lbImg.naturalWidth > 0) { lbImg.classList.add('bgt-loaded'); hideLbLoading(); }
@@ -1701,6 +1716,10 @@
         applyPostInfo();
         applyAltText();
         applyThumbs();
+        // Repaint from whatever is already known - a cached image is complete right away,
+        // otherwise onload / loadedmetadata fills it in a moment later. Sits after
+        // applyThumbs because the strip moves the stage's top edge, and so the image.
+        updateResBadge();
         // Pull the next page before nav (and the buffer) hit the end of what's loaded -
         // index-driven, so it works even when the grid behind is scrolled out of view
         // (unlike the viewport-gated maybeLoadMore). loadMore() no-ops if busy/done.
@@ -1912,6 +1931,46 @@
         const text = (settings.postInfo && st && st.text) ? st.text : '';
         setLinkified(lbPostText, text);
         lbPostText.style.display = text ? 'block' : 'none';
+    }
+
+    /* ---- media size badge --------------------------------------------------------
+     * "How big is the picture I'm actually looking at?" - answered from the element's
+     * own naturalWidth/naturalHeight rather than anything the API declared, so it's the
+     * true size of the bytes on screen: with the View Original Images script installed
+     * that's the untouched upload, without it the CDN's 2000px-capped fullsize.
+     * ----------------------------------------------------------------------------- */
+    function resBadgeDims() {
+        if (lbImg && lbImg.style.display !== 'none' && lbImg.naturalWidth
+            && lbImg.classList.contains('bgt-loaded'))
+            return [lbImg.naturalWidth, lbImg.naturalHeight];
+        if (lbVideo && lbVideo.style.display !== 'none' && lbVideo.videoWidth)
+            return [lbVideo.videoWidth, lbVideo.videoHeight];
+        return null;
+    }
+
+    // Pin the badge to the top-right corner of the media box. The stage centres and
+    // letterboxes whatever it holds, so the corner is wherever the picture ends - not
+    // where the stage does - and it has to be measured, not assumed.
+    function positionResBadge() {
+        if (!lbRes || lbRes.style.display !== 'block' || !lbStage) return;
+        const media = (lbImg && lbImg.style.display !== 'none') ? lbImg : lbVideo;
+        if (!media) return;
+        const s = lbStage.getBoundingClientRect();
+        const r = media.getBoundingClientRect();
+        if (!r.width || !r.height) return;
+        lbRes.style.top = Math.max(0, r.top - s.top) + 'px';
+        lbRes.style.right = Math.max(0, s.right - r.right) + 'px';
+    }
+
+    function updateResBadge() {
+        if (!lbRes) return;
+        const d = settings.resInfo ? resBadgeDims() : null;
+        // Zoomed, the image overflows the stage and pans under the cursor - there is no
+        // stable corner left to pin to, so the badge steps out until zoom is released.
+        if (!d || lbZoom > 1) { lbRes.style.display = 'none'; return; }
+        lbRes.textContent = d[0] + ' × ' + d[1];
+        lbRes.style.display = 'block';
+        positionResBadge();
     }
 
     function applyAltText() {
@@ -2222,6 +2281,7 @@
         lbImg.style.transform = '';
         lbImg.style.transformOrigin = '';
         lbImg.style.cursor = '';
+        updateResBadge(); // back to 1x: the corner is stable again, so the badge returns
     }
 
     // Cursor position as a % of the image's UNSCALED layout box, snapshotted in lbImgBox
@@ -2245,6 +2305,7 @@
         setZoomOrigin(e); // anchor the zoom at the cursor
         lbImg.style.transform = 'scale(' + lbZoom + ')';
         lbImg.style.cursor = 'zoom-out';
+        updateResBadge(); // hides it while zoomed
     }
 
     // While zoomed, follow the cursor so the user can pan without dragging.
@@ -3063,6 +3124,12 @@
         if (lbIsOpen() && grid.items[lbIndex]) lbSyncUrlSoon(lbBarUrl(grid.items[lbIndex]), false);
     }
 
+    function setResInfo(on) {
+        settings.resInfo = !!on;
+        GM_setValue(RESINFO_KEY, settings.resInfo);
+        updateResBadge(); // live-update if the lightbox is open
+    }
+
     function setWheel(on) {
         settings.wheel = !!on;
         GM_setValue(WHEEL_KEY, settings.wheel);
@@ -3212,6 +3279,10 @@
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.altText, onChange: (e) => setAltText(e.target.checked) }),
                 el('span', {}, 'Show image alt text (accessibility)')),
+            el('label', { class: 'bgt-check-row' },
+                el('input', { type: 'checkbox', checked: settings.resInfo, onChange: (e) => setResInfo(e.target.checked) }),
+                el('span', {}, 'Show pixel size over the media')),
+            el('div', { class: 'bgt-settings-hint' }, 'A small 3240 × 2400 badge in the media’s top-right corner, measured from the picture actually on screen — so with the View Original Images script installed it reads the untouched upload, and without it the CDN’s 2000px-capped copy. Videos show the rendition currently playing, which changes as the quality ladder settles. Hidden while zoomed.'),
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.continuousNav, onChange: (e) => setContinuousNav(e.target.checked) }),
                 el('span', {}, 'Continuous navigation across posts')),
@@ -3493,6 +3564,18 @@
             position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
             display: none; flex-direction: column; align-items: center; gap: 12px;
             color: #c3ccd6; font-size: 14px; font-weight: 600; z-index: 2; pointer-events: none;
+        }
+        /* Pixel-size badge. top/right are set from JS against the media's measured box,
+           so it rides the picture's own corner; inset a hair so it overlaps the image
+           rather than floating off it. pointer-events:none keeps drag-to-save working
+           right through it. */
+        #${LIGHTBOX_ID} .bgt-lb-res {
+            position: absolute; display: none; z-index: 2; pointer-events: none;
+            margin: 6px 6px 0 0; padding: 2px 7px; border-radius: 5px;
+            background: rgba(0,0,0,0.55); color: #e6e9ec;
+            font-size: 11px; font-weight: 600; line-height: 1.55;
+            font-variant-numeric: tabular-nums; letter-spacing: 0.02em; white-space: nowrap;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.95);
         }
         #${LIGHTBOX_ID} .bgt-lbvideo { max-width: 94vw; max-height: 90vh; object-fit: contain; border-radius: 4px; background: #000; }
         /* A definite box, sized by the video's aspect ratio, so the player fills the
