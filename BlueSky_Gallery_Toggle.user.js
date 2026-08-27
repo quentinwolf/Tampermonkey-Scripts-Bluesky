@@ -4,7 +4,7 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.21.0
+// @version      2.22.0
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky
 // @supportURL   https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/issues
@@ -1973,6 +1973,108 @@
         positionResBadge();
     }
 
+    /* ---- the same badge, over Bluesky's OWN image viewer --------------------------
+     * Clicking an image in the feed opens Bluesky's viewer, not ours, and the badge is
+     * just as wanted there. Two things differ:
+     *
+     *   • Its <img> is stretched across the whole stage with object-fit:contain, so the
+     *     element's rect is the letterbox, not the picture. The visible corner has to be
+     *     derived from the natural aspect ratio (drawnRect below).
+     *   • It's React's DOM, which will discard anything we graft into it. So this badge
+     *     lives on <body> as position:fixed and is driven by viewport coordinates -
+     *     nothing of ours ever enters Bluesky's tree.
+     *
+     * Matching is on structure + image URL, never on the class soup (regenerated every
+     * build) or the aria-label (translated on non-English UIs).
+     * ----------------------------------------------------------------------------- */
+    const NATIVE_IMG_SEL = 'img[src*="/img/feed_fullsize/"]';
+    let natRes = null; // the body-level badge, built on first use
+    let natRaf = 0;    // rAF handle; non-zero only while the follow loop is running
+
+    function nativeViewerRoot() {
+        const mods = document.querySelectorAll('[aria-modal="true"]');
+        for (const d of mods) {
+            if (lbEl && (d === lbEl || lbEl.contains(d))) continue; // that one's ours
+            if (d.querySelector(NATIVE_IMG_SEL)) return d;
+        }
+        return null;
+    }
+
+    // object-position as a pair of 0-1 fractions. Bluesky writes "left 50% top 50%";
+    // anything without two percentages (keywords, lengths) falls back to centred, which
+    // is the default and the only form that shows up here in practice.
+    function objectPosFractions(v) {
+        const pcts = String(v || '').match(/-?[\d.]+%/g);
+        if (!pcts || pcts.length < 2) return [0.5, 0.5];
+        return [parseFloat(pcts[0]) / 100, parseFloat(pcts[1]) / 100];
+    }
+
+    // Where the picture actually sits inside an <img> box. Under object-fit:contain the
+    // element is routinely much bigger than what it draws, so the corner we want is the
+    // one the aspect ratio lands on - not the element's own.
+    function drawnRect(img) {
+        const r = img.getBoundingClientRect();
+        const nw = img.naturalWidth, nh = img.naturalHeight;
+        if (!nw || !nh || !r.width || !r.height) return null;
+        const cs = getComputedStyle(img);
+        if (cs.objectFit !== 'contain') return r; // fill/cover/none: the box IS the picture
+        const scale = Math.min(r.width / nw, r.height / nh);
+        const w = nw * scale, h = nh * scale;
+        const [px, py] = objectPosFractions(cs.objectPosition);
+        const left = r.left + (r.width - w) * px;
+        const top = r.top + (r.height - h) * py;
+        return { left, top, width: w, height: h, right: left + w, bottom: top + h };
+    }
+
+    // A multi-image post mounts every page of the pager at once, so "the one being looked
+    // at" is whichever is centred in the window.
+    function nativeCurrentImg(root) {
+        const cx = window.innerWidth / 2;
+        let best = null, bestD = Infinity;
+        for (const img of root.querySelectorAll(NATIVE_IMG_SEL)) {
+            if (!img.complete || !img.naturalWidth) continue;
+            const r = img.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2) continue;
+            if (r.right <= 0 || r.left >= window.innerWidth) continue; // parked off-stage
+            const d = Math.abs((r.left + r.right) / 2 - cx);
+            if (d < bestD) { bestD = d; best = img; }
+        }
+        return best;
+    }
+
+    function hideNativeBadge() { if (natRes) natRes.style.display = 'none'; }
+
+    // One frame of the follow loop. It stops itself the moment the viewer is gone, so it
+    // only ever runs while Bluesky's viewer is actually open.
+    function nativeBadgeFrame() {
+        natRaf = 0;
+        // Our own viewer wins if both are somehow up - it draws its own badge.
+        const root = (settings.resInfo && !lbIsOpen()) ? nativeViewerRoot() : null;
+        if (!root) { hideNativeBadge(); return; }
+        const img = nativeCurrentImg(root);
+        const r = img && drawnRect(img);
+        if (!r) hideNativeBadge();
+        else {
+            if (!natRes) natRes = el('div', { id: 'bgt-native-res' });
+            if (!natRes.isConnected) document.body.appendChild(natRes);
+            const text = img.naturalWidth + ' × ' + img.naturalHeight;
+            if (natRes.textContent !== text) natRes.textContent = text;
+            let left = Math.min(window.innerWidth - 6, r.right - 6);
+            let top = Math.min(window.innerHeight - 30, Math.max(6, r.top + 6));
+            // Bluesky parks its own ⋯ and ✕ in the viewer's top-right; an image that
+            // nearly fills the window would tuck the badge under them, so drop below.
+            if (top < 64 && left > window.innerWidth - 130) top = 64;
+            natRes.style.left = Math.round(left) + 'px';
+            natRes.style.top = Math.round(top) + 'px';
+            natRes.style.display = 'block';
+        }
+        natRaf = requestAnimationFrame(nativeBadgeFrame);
+    }
+
+    function startNativeBadge() {
+        if (!natRaf) natRaf = requestAnimationFrame(nativeBadgeFrame);
+    }
+
     function applyAltText() {
         if (!lbCap) return;
         const it = grid.items[lbIndex];
@@ -3127,7 +3229,8 @@
     function setResInfo(on) {
         settings.resInfo = !!on;
         GM_setValue(RESINFO_KEY, settings.resInfo);
-        updateResBadge(); // live-update if the lightbox is open
+        updateResBadge();   // live-update if our lightbox is open
+        startNativeBadge(); // ...and if Bluesky's is (a frame with it off just hides + stops)
     }
 
     function setWheel(on) {
@@ -3282,7 +3385,7 @@
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.resInfo, onChange: (e) => setResInfo(e.target.checked) }),
                 el('span', {}, 'Show pixel size over the media')),
-            el('div', { class: 'bgt-settings-hint' }, 'A small 3240 × 2400 badge in the media’s top-right corner, measured from the picture actually on screen — so with the View Original Images script installed it reads the untouched upload, and without it the CDN’s 2000px-capped copy. Videos show the rendition currently playing, which changes as the quality ladder settles. Hidden while zoomed.'),
+            el('div', { class: 'bgt-settings-hint' }, 'A small 3240 × 2400 badge in the media’s top-right corner, measured from the picture actually on screen — so with the View Original Images script installed it reads the untouched upload, and without it the CDN’s 2000px-capped copy. Applies to Bluesky’s own image viewer too, not just this one. Videos show the rendition currently playing, which changes as the quality ladder settles. Hidden while zoomed in this viewer.'),
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.continuousNav, onChange: (e) => setContinuousNav(e.target.checked) }),
                 el('span', {}, 'Continuous navigation across posts')),
@@ -3577,6 +3680,18 @@
             font-variant-numeric: tabular-nums; letter-spacing: 0.02em; white-space: nowrap;
             text-shadow: 0 1px 2px rgba(0,0,0,0.95);
         }
+        /* The same badge over Bluesky's own viewer. Body-level and fixed rather than a
+           child of the stage, because that DOM is React's and ours would be discarded;
+           left/top are viewport coordinates, and translateX pins the RIGHT edge there. */
+        #bgt-native-res {
+            position: fixed; display: none; z-index: 99998; pointer-events: none;
+            transform: translateX(-100%);
+            padding: 2px 7px; border-radius: 5px;
+            background: rgba(0,0,0,0.55); color: #e6e9ec;
+            font: 600 11px/1.55 InterVariable, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, sans-serif;
+            font-variant-numeric: tabular-nums; letter-spacing: 0.02em; white-space: nowrap;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.95);
+        }
         #${LIGHTBOX_ID} .bgt-lbvideo { max-width: 94vw; max-height: 90vh; object-fit: contain; border-radius: 4px; background: #000; }
         /* A definite box, sized by the video's aspect ratio, so the player fills the
            stage and upscales a low starting rendition (object-fit) instead of shrinking
@@ -3818,6 +3933,16 @@
         // history wrapper coexist with our hash mirroring.
         unsafeWindow.addEventListener('hashchange', onTabHashChange);
 
+        // Bluesky's own viewer has no event to hook, but the full-size image it mounts
+        // does: `load` doesn't bubble, yet it DOES capture, so this one listener catches
+        // every viewer opening (and every arrow-key move within one) for the cost of a
+        // tag check per image the page loads.
+        document.addEventListener('load', (e) => {
+            const t = e.target;
+            if (settings.resInfo && t && t.tagName === 'IMG' &&
+                t.src.indexOf('/img/feed_fullsize/') !== -1) startNativeBadge();
+        }, true);
+
         // Watches for navigation AND profile tab switches. The Media/Videos pager
         // doesn't change the URL, so href alone isn't enough - routeSig() also folds
         // in the active-tab state. tickTabSync runs every tick too (not just on change)
@@ -3830,6 +3955,9 @@
             else if (galleryEnabled && rootEl && !rootEl.isConnected) syncGallery();
             tickTabSync();
             tickPostDeepLink();
+            // Safety net for a viewer opened on images the load listener never saw fire
+            // (already-decoded, restored from bfcache). No-ops once the loop is running.
+            if (!natRaf && settings.resInfo && nativeViewerRoot()) startNativeBadge();
         }, 500);
 
         tickTabSync(); // apply any hash present on first paint
