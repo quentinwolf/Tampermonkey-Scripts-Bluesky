@@ -4,12 +4,12 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.22.1
+// @version      2.23.0
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky
 // @supportURL   https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/issues
 // @match        *://bsky.app/*
-// @require      https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js
+// @require      https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js
 // @downloadURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
 // @updateURL    https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/raw/refs/heads/main/BlueSky_Gallery_Toggle.user.js
 // @run-at       document-start
@@ -371,37 +371,44 @@
     }
 
     /* ======================================================================
-     * 2. API: getAuthorFeed?filter=posts_with_media, paginated by cursor.
+     * 2. API reads, and getAuthorFeed?filter=posts_with_media paginated by cursor.
      * ==================================================================== */
+    // The one read path every XRPC query goes through. Authed first - replaying the
+    // app's session, so moderated / adult media and viewer state resolve exactly as the
+    // app sees them - then the public AppView (default moderation, no viewer block).
+    // `authed` says which path answered: loadProfile only trusts follow state from an
+    // authed read. Throws only when the public fallback fails too.
+    async function xrpcRead(method, params) {
+        const path = '/xrpc/' + method + '?' + new URLSearchParams(params).toString();
+        if (auth.origin && auth.headers) {
+            try {
+                const res = await nativeFetch(auth.origin + path, { headers: auth.headers, credentials: 'omit' });
+                if (res.ok) return { data: await res.json(), authed: true }; // awaited, so a bad body falls through too
+            } catch (e) { /* fall through to public */ }
+        }
+        const res = await nativeFetch(PUBLIC_API + path, { headers: { 'accept-language': navigator.language || 'en' } });
+        if (!res.ok) throw new Error(method.split('.').pop() + ' ' + res.status);
+        return { data: await res.json(), authed: false };
+    }
+
+    async function xrpcGet(method, params) {
+        return (await xrpcRead(method, params)).data;
+    }
+
     async function fetchMediaPage(actor, cursor, filter) {
-        const buildPath = (f) => {
-            const params = new URLSearchParams({ actor: actor, filter: f, limit: String(PAGE_LIMIT) });
-            if (cursor) params.set('cursor', cursor);
-            return '/xrpc/app.bsky.feed.getAuthorFeed?' + params.toString();
+        const params = (f) => {
+            const p = { actor: actor, filter: f, limit: String(PAGE_LIMIT) };
+            if (cursor) p.cursor = cursor;
+            return p;
         };
-
-        const fetchPath = async (path) => {
-            // Preferred: replay the app's authenticated request.
-            if (auth.origin && auth.headers) {
-                try {
-                    const res = await nativeFetch(auth.origin + path, { headers: auth.headers, credentials: 'omit' });
-                    if (res.ok) return await res.json(); // awaited, so a bad body falls through too
-                } catch (e) { /* fall through to public */ }
-            }
-            // Fallback: public AppView, no auth (default moderation applies).
-            const res = await nativeFetch(PUBLIC_API + path, { headers: { 'accept-language': navigator.language || 'en' } });
-            if (!res.ok) throw new Error('getAuthorFeed ' + res.status);
-            return res.json();
-        };
-
         try {
-            return await fetchPath(buildPath(filter));
+            return await xrpcGet('app.bsky.feed.getAuthorFeed', params(filter));
         } catch (e) {
             // Older AppViews may not know the posts_with_video filter; widen to all media
             // (the caller still filters to videos client-side).
             if (filter === 'posts_with_video') {
                 logDebug('filter "posts_with_video" failed (' + (e && e.message) + '); retrying posts_with_media');
-                return fetchPath(buildPath('posts_with_media'));
+                return xrpcGet('app.bsky.feed.getAuthorFeed', params('posts_with_media'));
             }
             throw e;
         }
@@ -614,7 +621,7 @@
         if (grid.drops.length < DROP_LOG_MAX) grid.drops.push(rec);
         logDebug('media dropped:', rec);
     }
-    let rootEl, scrollEl, gridEl, sentinelEl, countEl, io, overlayKeyHandler;
+    let rootEl, scrollEl, gridEl, sentinelEl, countEl, io;
     let mountedMode = null, inlineHost = null, inlineResizeHandler = null;
     let headerTitleEl = null, followBtn = null, inlineScrollHandler = null, followVisTick = false;
     // Viewed profile's identity + follow state, populated by loadProfile() from
@@ -658,7 +665,7 @@
         const sub = el('div', { class: 'bgt-sub' }, grid.videosOnly ? 'Video gallery' : 'Media gallery');
         countEl = el('div', { class: 'bgt-sub bgt-count' }, '');
 
-        const closeBtn = el('button', { class: 'bgt-iconbtn', title: 'Close gallery (Esc)', onClick: closeGallery }, '✕');
+        const closeBtn = el('button', { class: 'bgt-iconbtn', title: 'Close gallery', onClick: closeGallery }, '✕');
         const gearBtn = el('button', { class: 'bgt-iconbtn', title: 'Gallery settings', onClick: openSettings }, svgIcon(ICON_GEAR, 20, 20));
         const openProfile = el('a', {
             class: 'bgt-iconbtn', title: 'Open profile in new tab', target: '_blank', rel: 'noopener',
@@ -849,37 +856,57 @@
         });
         // Real anchor (not a button) so the browser's own link affordances all point
         // at the actual post: middle-click / ctrl- / shift-click open it in a new tab,
-        // and the right-click menu offers "Open in new tab" + "Copy link". We only
-        // hijack a plain left-click for the in-grid lightbox / open-post behaviour.
-        const tile = el('a', {
-            class: 'bgt-tile', title: t.alt || '', href: t.url,
-            onClick: (e) => {
-                // Leave modified / non-primary clicks to the browser (new tab, etc).
-                if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-                e.preventDefault();
-                // Images and native videos have a lightbox slot; GIF/external open the post.
-                if (t._lbIndex != null) openLightbox(t._lbIndex);
-                else unsafeWindow.open(t.url, '_blank', 'noopener');
-            },
-        }, img);
+        // and the right-click menu offers "Open in new tab" + "Copy link". A plain
+        // left-click is hijacked for the lightbox - by bindGridEvents, not here.
+        const tile = el('a', { class: 'bgt-tile', title: t.alt || '', href: t.url }, img);
 
         if (t.kind === 'video') {
             const badge = el('span', { class: 'bgt-badge' }, svgIcon(ICON_PLAY, 12, 12), t.label || 'Video');
             tile.appendChild(badge);
         }
-
-        // Hover tooltip (post date / counts). Settings are read at hover-time so the
-        // toggles take effect without rebuilding the grid; mousemove only repositions
-        // while a tooltip is actually showing, so it's free when the feature is off.
-        tile.addEventListener('mouseenter', (e) => {
-            const lines = tooltipLinesFor(t.postState);
-            if (lines.length) showTooltip(lines, e.clientX, e.clientY);
-        });
-        tile.addEventListener('mousemove', (e) => {
-            if (ttEl && ttEl.style.display !== 'none') positionTooltip(e.clientX, e.clientY);
-        });
-        tile.addEventListener('mouseleave', hideTooltip);
+        tileData.set(tile, t);
         return tile;
+    }
+
+    // Tile element -> the tile record it was built from. Weak, so a torn-down grid's
+    // tiles are collected with it.
+    const tileData = new WeakMap();
+
+    // One set of listeners on the grid rather than three closures per tile - a profile
+    // with a few thousand tiles would otherwise carry several thousand of them.
+    function bindGridEvents(g) {
+        const tileAt = (e) => (e.target && e.target.closest) ? e.target.closest('.bgt-tile') : null;
+
+        g.addEventListener('click', (e) => {
+            const tile = tileAt(e);
+            const t = tile && tileData.get(tile);
+            if (!t) return;
+            // Leave modified / non-primary clicks to the browser (new tab, etc).
+            if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+            e.preventDefault();
+            // Images and native videos have a lightbox slot; GIF/external open the post.
+            if (t._lbIndex != null) openLightbox(t._lbIndex);
+            else unsafeWindow.open(t.url, '_blank', 'noopener');
+        });
+
+        // Hover tooltip (post date / counts). mouseover bubbles where mouseenter doesn't;
+        // ttTile keeps a move between a tile's own children (img -> badge) from
+        // re-rendering. Settings are read at hover-time so the toggles take effect
+        // without rebuilding the grid.
+        g.addEventListener('mouseover', (e) => {
+            const tile = tileAt(e);
+            if (tile === ttTile) return;
+            if (!tile) { hideTooltip(); return; } // the gap between tiles
+            const t = tileData.get(tile);
+            const lines = tooltipLinesFor(t && t.postState);
+            if (lines.length) { showTooltip(lines, e.clientX, e.clientY); ttTile = tile; }
+            else hideTooltip();
+        });
+        // Only repositions while a tooltip is actually showing, so it's free when off.
+        g.addEventListener('mousemove', (e) => {
+            if (ttTile && ttEl && ttEl.style.display !== 'none') positionTooltip(e.clientX, e.clientY);
+        });
+        g.addEventListener('mouseleave', hideTooltip);
     }
 
     function appendTiles(tiles) {
@@ -974,19 +1001,6 @@
      *       bgtInspect(url)   - re-fetch one post and line the API's media up
      *                           against the tiles that actually made it in.
      * ==================================================================== */
-    async function xrpcGet(method, params) {
-        const path = '/xrpc/' + method + '?' + new URLSearchParams(params).toString();
-        if (auth.origin && auth.headers) { // authed first, so moderated media resolves
-            try {
-                const res = await nativeFetch(auth.origin + path, { headers: auth.headers, credentials: 'omit' });
-                if (res.ok) return await res.json(); // awaited, so a bad body falls through too
-            } catch (e) { /* fall through to public */ }
-        }
-        const res = await nativeFetch(PUBLIC_API + path, { headers: { 'accept-language': navigator.language || 'en' } });
-        if (!res.ok) throw new Error(method + ' ' + res.status);
-        return res.json();
-    }
-
     // bsky.app/profile/<handle|did>/post/<rkey> -> at://<did>/app.bsky.feed.post/<rkey>
     async function toAtUri(ref) {
         ref = String(ref || '').trim();
@@ -1191,6 +1205,7 @@
      * that carries no postState, e.g. a GIF embed) we simply show nothing.
      * -------------------------------------------------------------------- */
     let ttEl = null;
+    let ttTile = null; // the grid tile the tooltip is showing for (null when hidden)
 
     function tooltipLinesFor(ps) {
         if (!settings.tooltip || !ps) return [];
@@ -1227,7 +1242,10 @@
         positionTooltip(x, y);
     }
 
-    function hideTooltip() { if (ttEl) ttEl.style.display = 'none'; }
+    function hideTooltip() {
+        ttTile = null; // so re-entering the same tile (e.g. after the lightbox) shows it again
+        if (ttEl) ttEl.style.display = 'none';
+    }
 
     // Appended to a failure log when the borrowed session has gone stale, so the
     // console says what to do rather than just dumping an opaque error.
@@ -1236,60 +1254,40 @@
     // Each toggle flips the UI optimistically, fires the write, and rolls back on
     // failure. Without a writable session we just open the post so the user can act
     // natively. A busy flag guards against double-taps racing the network.
-    async function toggleLike(st) {
-        if (!st || st._busyLike) return;
-        const did = getMyDid();
-        if (!did) { unsafeWindow.open(st.url, '_blank', 'noopener'); return; }
-        st._busyLike = true;
-        const was = !!st.likeUri, prev = st.likeUri;
-        st.likeUri = was ? null : 'pending';
-        st.likeCount = Math.max(0, st.likeCount + (was ? -1 : 1));
-        updateActionBar();
-        try {
-            if (was) {
-                await repoDelete(did, 'app.bsky.feed.like', rkeyOf(prev));
-                st.likeUri = null;
-            } else {
-                const r = await repoCreate(did, 'app.bsky.feed.like',
-                    { '$type': 'app.bsky.feed.like', subject: { uri: st.uri, cid: st.cid }, createdAt: new Date().toISOString() });
-                st.likeUri = (r && r.uri) || null;
-                if (!st.likeUri) throw new Error('no uri returned');
-            }
-        } catch (e) {
-            console.error('[Gallery Toggle] like failed' + staleHint() + ':', e);
-            st.likeUri = prev;
-            st.likeCount = Math.max(0, st.likeCount + (was ? 1 : -1));
-        } finally {
-            st._busyLike = false;
-            updateActionBar();
-        }
-    }
+    // Like and repost are the same write: a repo record whose subject is the post, and
+    // whose returned URI we keep so the toggle can delete it again. Each kind names the
+    // postState fields it drives.
+    const RECORD_TOGGLES = {
+        like:   { collection: 'app.bsky.feed.like',   uri: 'likeUri',   count: 'likeCount',   busy: '_busyLike' },
+        repost: { collection: 'app.bsky.feed.repost', uri: 'repostUri', count: 'repostCount', busy: '_busyRepost' },
+    };
 
-    async function toggleRepost(st) {
-        if (!st || st._busyRepost) return;
+    async function toggleRecord(st, kind) {
+        const f = RECORD_TOGGLES[kind];
+        if (!st || !f || st[f.busy]) return;
         const did = getMyDid();
         if (!did) { unsafeWindow.open(st.url, '_blank', 'noopener'); return; }
-        st._busyRepost = true;
-        const was = !!st.repostUri, prev = st.repostUri;
-        st.repostUri = was ? null : 'pending';
-        st.repostCount = Math.max(0, st.repostCount + (was ? -1 : 1));
+        st[f.busy] = true;
+        const was = !!st[f.uri], prev = st[f.uri];
+        st[f.uri] = was ? null : 'pending';
+        st[f.count] = Math.max(0, st[f.count] + (was ? -1 : 1));
         updateActionBar();
         try {
             if (was) {
-                await repoDelete(did, 'app.bsky.feed.repost', rkeyOf(prev));
-                st.repostUri = null;
+                await repoDelete(did, f.collection, rkeyOf(prev));
+                st[f.uri] = null;
             } else {
-                const r = await repoCreate(did, 'app.bsky.feed.repost',
-                    { '$type': 'app.bsky.feed.repost', subject: { uri: st.uri, cid: st.cid }, createdAt: new Date().toISOString() });
-                st.repostUri = (r && r.uri) || null;
-                if (!st.repostUri) throw new Error('no uri returned');
+                const r = await repoCreate(did, f.collection,
+                    { '$type': f.collection, subject: { uri: st.uri, cid: st.cid }, createdAt: new Date().toISOString() });
+                st[f.uri] = (r && r.uri) || null;
+                if (!st[f.uri]) throw new Error('no uri returned');
             }
         } catch (e) {
-            console.error('[Gallery Toggle] repost failed' + staleHint() + ':', e);
-            st.repostUri = prev;
-            st.repostCount = Math.max(0, st.repostCount + (was ? 1 : -1));
+            console.error('[Gallery Toggle] ' + kind + ' failed' + staleHint() + ':', e);
+            st[f.uri] = prev;
+            st[f.count] = Math.max(0, st[f.count] + (was ? 1 : -1));
         } finally {
-            st._busyRepost = false;
+            st[f.busy] = false;
             updateActionBar();
         }
     }
@@ -1323,28 +1321,11 @@
      *     likes/reposts - the subject is the target DID, and the returned record URI
      *     is what we delete to unfollow.
      * ==================================================================== */
-    // Resolves to { data, authed } (or null): `authed` says which path served it, so
-    // loadProfile knows whether the viewer/follow state in `data` can be trusted.
-    async function fetchProfile(actor) {
-        const path = '/xrpc/app.bsky.actor.getProfile?actor=' + encodeURIComponent(actor);
-        // Authed first so viewer.following comes back; fall back to the public AppView
-        // (handle/displayName only - no follow state without a session).
-        if (auth.origin && auth.headers) {
-            try {
-                const res = await nativeFetch(auth.origin + path, { headers: auth.headers, credentials: 'omit' });
-                if (res.ok) return { data: await res.json(), authed: true };
-            } catch (e) { /* fall through to public */ }
-        }
-        try {
-            const res = await nativeFetch(PUBLIC_API + path, { headers: { 'accept-language': navigator.language || 'en' } });
-            if (res.ok) return { data: await res.json(), authed: false };
-        } catch (e) { /* ignore */ }
-        return null;
-    }
-
     async function loadProfile(actor) {
+        // Authed so viewer.following comes back; the public fallback carries the handle
+        // and display name only (xrpcRead's `authed` flag says which one answered).
         let r;
-        try { r = await fetchProfile(actor); } catch (e) { r = null; }
+        try { r = await xrpcRead('app.bsky.actor.getProfile', { actor: actor }); } catch (e) { r = null; }
         if (!r || !r.data || grid.actor !== actor) return; // gallery closed or switched while we waited
         const data = r.data;
         profile.did = data.did || null;
@@ -1412,7 +1393,11 @@
         if (!rootEl) return false;
         const header = rootEl.querySelector('.bgt-header');
         if (!header) return false;
-        return header.getBoundingClientRect().top <= stickyTabBarHeight() + 120;
+        // This runs per scroll frame, so reuse the tab-bar height applyInlineSticky already
+        // measured into style.top (refreshed on resize / theme change) instead of querying
+        // and measuring the tablist again every frame.
+        const pinned = parseFloat(header.style.top);
+        return header.getBoundingClientRect().top <= (isNaN(pinned) ? stickyTabBarHeight() : pinned) + 120;
     }
 
     function updateFollowVisibility() {
@@ -1438,7 +1423,7 @@
         requestAnimationFrame(() => { followVisTick = false; updateFollowVisibility(); });
     }
 
-    // Optimistic follow/unfollow, mirroring toggleLike/toggleRepost: flip the UI now,
+    // Optimistic follow/unfollow, mirroring toggleRecord: flip the UI now,
     // fire the write, roll back on failure. Without a writable session we just open the
     // profile so the user can act natively. _busyFollow guards against double-taps.
     async function toggleFollow() {
@@ -1572,8 +1557,8 @@
         // Native-style action bar. Each handler reads the post currently shown, so
         // the single reused bar always acts on the right post as you navigate.
         lbReply = lbActButton('reply', ICON_REPLY, true, () => { const st = curPostState(); if (st) unsafeWindow.open(st.url, '_blank', 'noopener'); });
-        lbRepost = lbActButton('repost', ICON_REPOST, true, () => toggleRepost(curPostState()));
-        lbLike = lbActButton('like', ICON_HEART, true, () => toggleLike(curPostState()));
+        lbRepost = lbActButton('repost', ICON_REPOST, true, () => toggleRecord(curPostState(), 'repost'));
+        lbLike = lbActButton('like', ICON_HEART, true, () => toggleRecord(curPostState(), 'like'));
         lbBookmark = lbActButton('bookmark', ICON_BOOKMARK, false, () => toggleBookmark(curPostState()));
         // Muted post timestamp, sits just before the Open-post link.
         lbTime = el('span', { class: 'bgt-lb-time' });
@@ -2033,6 +2018,10 @@
     const NATIVE_IMG_SEL = 'img[src*="/img/feed_fullsize/"]';
     let natRes = null; // the body-level badge, built on first use
     let natRaf = 0;    // rAF handle; non-zero only while the follow loop is running
+    // The loop runs every frame while the viewer is open, so it keeps what it can:
+    let natRoot = null;           // the viewer's modal, reused while it still holds an image
+    let natLast = '';             // last text|left|top written; an unchanged frame writes nothing
+    const natFit = new WeakMap(); // img -> { contain, pos }: its object-fit/position, read once
 
     function nativeViewerRoot() {
         const mods = document.querySelectorAll('[aria-modal="true"]');
@@ -2059,11 +2048,18 @@
         const r = img.getBoundingClientRect();
         const nw = img.naturalWidth, nh = img.naturalHeight;
         if (!nw || !nh || !r.width || !r.height) return null;
-        const cs = getComputedStyle(img);
-        if (cs.objectFit !== 'contain') return r; // fill/cover/none: the box IS the picture
+        // Computed style is the costly read here and doesn't change for a given image,
+        // so it's taken once per element rather than once per frame.
+        let fit = natFit.get(img);
+        if (!fit) {
+            const cs = getComputedStyle(img);
+            fit = { contain: cs.objectFit === 'contain', pos: objectPosFractions(cs.objectPosition) };
+            natFit.set(img, fit);
+        }
+        if (!fit.contain) return r; // fill/cover/none: the box IS the picture
         const scale = Math.min(r.width / nw, r.height / nh);
         const w = nw * scale, h = nh * scale;
-        const [px, py] = objectPosFractions(cs.objectPosition);
+        const [px, py] = fit.pos;
         const left = r.left + (r.width - w) * px;
         const top = r.top + (r.height - h) * py;
         return { left, top, width: w, height: h, right: left + w, bottom: top + h };
@@ -2085,31 +2081,47 @@
         return best;
     }
 
-    function hideNativeBadge() { if (natRes) natRes.style.display = 'none'; }
+    function hideNativeBadge() {
+        natLast = ''; // force a full write the next time it's shown
+        if (natRes) natRes.style.display = 'none';
+    }
 
     // One frame of the follow loop. It stops itself the moment the viewer is gone, so it
     // only ever runs while Bluesky's viewer is actually open.
     function nativeBadgeFrame() {
         natRaf = 0;
         // Our own viewer wins if both are somehow up - it draws its own badge.
-        const root = (settings.resInfo && !lbIsOpen()) ? nativeViewerRoot() : null;
-        if (!root) { hideNativeBadge(); return; }
-        const img = nativeCurrentImg(root);
+        if (!settings.resInfo || lbIsOpen()) { natRoot = null; hideNativeBadge(); return; }
+        // Reuse last frame's modal while it still yields an image; otherwise search the
+        // document again (first frame, viewer swapped, or an image still decoding) - and
+        // if that finds nothing, the viewer has closed and the loop ends.
+        let img = (natRoot && natRoot.isConnected) ? nativeCurrentImg(natRoot) : null;
+        if (!img) {
+            natRoot = nativeViewerRoot();
+            if (!natRoot) { hideNativeBadge(); return; }
+            img = nativeCurrentImg(natRoot);
+        }
         const r = img && drawnRect(img);
         if (!r) hideNativeBadge();
         else {
             if (!natRes) natRes = el('div', { id: 'bgt-native-res' });
-            if (!natRes.isConnected) document.body.appendChild(natRes);
+            if (!natRes.isConnected) { document.body.appendChild(natRes); natLast = ''; }
             const text = img.naturalWidth + ' × ' + img.naturalHeight;
-            if (natRes.textContent !== text) natRes.textContent = text;
             let left = Math.min(window.innerWidth - 6, r.right - 6);
             let top = Math.min(window.innerHeight - 30, Math.max(6, r.top + 6));
             // Bluesky parks its own ⋯ and ✕ in the viewer's top-right; an image that
             // nearly fills the window would tuck the badge under them, so drop below.
             if (top < 64 && left > window.innerWidth - 130) top = 64;
-            natRes.style.left = Math.round(left) + 'px';
-            natRes.style.top = Math.round(top) + 'px';
-            natRes.style.display = 'block';
+            left = Math.round(left); top = Math.round(top);
+            // A still viewer is the common case: nothing moved, so touch nothing.
+            const key = text + '|' + left + '|' + top;
+            if (key !== natLast) {
+                natLast = key;
+                if (natRes.textContent !== text) natRes.textContent = text;
+                natRes.style.left = left + 'px';
+                natRes.style.top = top + 'px';
+                natRes.style.display = 'block';
+            }
         }
         natRaf = requestAnimationFrame(nativeBadgeFrame);
     }
@@ -2791,8 +2803,9 @@
         return all.filter(isOnScreen);
     }
 
-    function activeProfileTab() {
-        for (const lab of visibleProfileTabs()) {
+    // `tabs` lets a caller that already holds visibleProfileTabs() skip the re-query.
+    function activeProfileTab(tabs) {
+        for (const lab of (tabs || visibleProfileTabs())) {
             if (lab.querySelector('[style*="background-color"]')) {
                 return (lab.getAttribute('data-testid') || '').replace('profilePager-', '').toLowerCase();
             }
@@ -2808,15 +2821,19 @@
         const m = location.pathname.match(/^\/profile\/([^/]+)(?:\/(media|video|videos|replies|likes|with_replies))?\/?$/);
         if (!m) return null;
         // Active tab from the DOM pager; fall back to the URL segment (deep links, or
-        // before the pager has painted).
-        let tab = activeProfileTab();
+        // before the pager has painted). `active` keeps the raw DOM reading (null until
+        // painted) and `tabs` the pager list, so tickTabSync can reuse both rather than
+        // query the pager again on the same tick.
+        const tabs = visibleProfileTabs();
+        const active = activeProfileTab(tabs);
+        let tab = active;
         if (!tab) {
             const seg = m[2];
             if (seg === 'video' || seg === 'videos') tab = 'videos';
             else if (seg === 'media') tab = 'media';
             else tab = seg || 'posts';
         }
-        return { actor: decodeURIComponent(m[1]), tab: tab };
+        return { actor: decodeURIComponent(m[1]), tab: tab, active: active, tabs: tabs };
     }
 
     /* ======================================================================
@@ -2833,15 +2850,13 @@
      * ==================================================================== */
     const TAB_HASH_ALIAS = { video: 'videos', with_replies: 'replies' }; // accept the path-style spellings too
 
-    function profileTabButtons() {
-        return visibleProfileTabs(); // DOM order, so [0] is still the leftmost (default) tab
-    }
     function tabNameOf(btn) {
         return (btn.getAttribute('data-testid') || '').replace('profilePager-', '').toLowerCase();
     }
     // The leftmost pager tab is Bluesky's default (Posts) - the one shown with no hash.
-    function defaultTabName() {
-        const btns = profileTabButtons();
+    // visibleProfileTabs() is in DOM order, so [0] is the leftmost.
+    function defaultTabName(tabs) {
+        const btns = tabs || visibleProfileTabs();
         return btns.length ? tabNameOf(btns[0]) : 'posts';
     }
     function tabFromHash() {
@@ -2914,9 +2929,10 @@
     // pager reading has stopped moving (see phase 2).
     const tabSync = { actor: null, pendingHash: null, deadline: 0, settleAt: 0, lastActive: null };
 
-    function tickTabSync() {
+    // `route` is the poller's own currentProfileRoute() for this tick, when it has one.
+    function tickTabSync(route) {
         if (!settings.tabHash) return;
-        const r = currentProfileRoute();
+        const r = route !== undefined ? route : currentProfileRoute();
         if (!r) { tabSync.actor = null; tabSync.pendingHash = null; return; }
 
         // Entering a profile: take the hash as a deep-link target. On the page's very
@@ -2935,7 +2951,7 @@
             tabSync.lastActive = null;
         }
 
-        const active = activeProfileTab();
+        const active = r.active;
 
         // Phase 1 - drive the pager to a pending deep-link target.
         if (tabSync.pendingHash) {
@@ -2960,7 +2976,7 @@
             tabSync.lastActive = active;
             return;
         }
-        setTabHash(active === defaultTabName() ? '' : active);
+        setTabHash(active === defaultTabName(r.tabs) ? '' : active);
     }
 
     // A typed hash, an in-page #anchor, or back/forward landing on a hash: queue it as
@@ -3013,6 +3029,7 @@
         resetProfileState(actor);
 
         gridEl = el('div', { class: 'bgt-grid' });
+        bindGridEvents(gridEl);
         sentinelEl = el('div', { class: 'bgt-sentinel' }, el('div', { class: 'bgt-spinner' }));
         pendingHeader = buildHeader(actor); // reads grid.videosOnly, set just above
         loadProfile(actor);                 // resolve @handle + follow state (async)
@@ -3032,20 +3049,9 @@
             if (entries.some(e => e.isIntersecting)) loadMore();
         }, { root: scrollEl || null, rootMargin: '800px' });
         io.observe(sentinelEl);
-
-        overlayKeyHandler = (e) => {
-            if (e.key !== 'Escape' || e.defaultPrevented || lbIsOpen()) return;
-            // In-line leaves the rest of the page live, so an Esc there usually belongs to
-            // something else - a search box, a menu, Bluesky's own dialog - and must not
-            // switch the gallery off for good.
-            if (mountedMode === 'inline') {
-                const t = e.target;
-                if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
-                if (Array.from(document.querySelectorAll('[aria-modal="true"]')).some(d => !lbEl || !lbEl.contains(d))) return;
-            }
-            closeGallery();
-        };
-        document.addEventListener('keydown', overlayKeyHandler);
+        // Deliberately no Esc-to-close: turning the gallery off is a persisted setting, so
+        // it only happens through an explicit control (the nav button or the header ✕),
+        // never a stray keypress meant for the lightbox, a search box or a menu.
 
         loadMore();
         updateFollowVisibility(); // header is mounted now; reflect the current pin state
@@ -3099,7 +3105,6 @@
         lbClosePlain(); // a teardown, not a user close: never rewind the history here
         if (lbEl) { lbEl.remove(); lbEl = null; lbFollowBtn = lbHandleLink = null; }
         if (io) { io.disconnect(); io = null; }
-        if (overlayKeyHandler) { document.removeEventListener('keydown', overlayKeyHandler); overlayKeyHandler = null; }
         if (rootEl) { rootEl.remove(); rootEl = null; }
         if (inlineHost) { inlineHost.classList.remove('bgt-feed-hidden'); inlineHost = null; }
         mountedMode = null;
@@ -3657,6 +3662,12 @@
             position: relative; display: block; aspect-ratio: 1 / 1; overflow: hidden; background: #11171f;
             border: none; padding: 0; cursor: pointer; border-radius: 2px;
             text-decoration: none; color: inherit;
+            /* Skip layout + paint for tiles scrolled well out of view - on a profile with
+               thousands of tiles most of the grid is off-screen at any moment. Height
+               still comes from aspect-ratio (overflow:hidden makes the tile a scroll
+               container, so its minimum height doesn't follow the placeholder size),
+               and 'auto' remembers each tile's real size once it has rendered. */
+            content-visibility: auto; contain-intrinsic-size: auto 150px;
         }
         #${OVERLAY_ID} .bgt-tile img {
             width: 100%; height: 100%; object-fit: cover; display: block; transition: transform .15s ease;
@@ -3963,8 +3974,9 @@
     }
 
     let lastSig = '';
-    function routeSig() {
-        const r = currentProfileRoute();
+    // `route` is optional: the poller passes the one it already computed this tick.
+    function routeSig(route) {
+        const r = route !== undefined ? route : currentProfileRoute();
         return location.href + '|' + (r ? r.tab : '-');
     }
     function onRouteChange() {
@@ -4015,12 +4027,17 @@
         // in the active-tab state. tickTabSync runs every tick too (not just on change)
         // so a pending deep-link keeps retrying until the pager paints.
         setInterval(() => {
-            if (routeSig() !== lastSig) onRouteChange();
-            // Watchdog: a Bluesky re-render (e.g. crossing a responsive layout
-            // breakpoint) can detach the in-line gallery without any route/tab
-            // change; remount it.
-            else if (galleryEnabled && rootEl && !rootEl.isConnected) syncGallery();
-            tickTabSync();
+            // One route read per tick, shared by the change check and the tab sync - each
+            // read queries (and on a cached-screen page, measures) the pager tabs.
+            const r = currentProfileRoute();
+            if (routeSig(r) !== lastSig) onRouteChange(); // runs its own fresh tickTabSync
+            else {
+                // Watchdog: a Bluesky re-render (e.g. crossing a responsive layout
+                // breakpoint) can detach the in-line gallery without any route/tab
+                // change; remount it.
+                if (galleryEnabled && rootEl && !rootEl.isConnected) syncGallery();
+                tickTabSync(r);
+            }
             tickPostDeepLink();
             // Safety net for a viewer opened on images the load listener never saw fire
             // (already-decoded, restored from bfcache). No-ops once the loop is running.
