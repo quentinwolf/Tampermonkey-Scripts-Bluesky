@@ -4,7 +4,7 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.22.0
+// @version      2.22.1
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky
 // @supportURL   https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/issues
@@ -170,7 +170,7 @@
     }
 
     function rememberDid(handle, did) {
-        if (!handle || !did || String(handle).indexOf('did:') === 0) return;
+        if (!validHandle(handle) || !did || String(handle).indexOf('did:') === 0) return;
         const key = String(handle).toLowerCase();
         const c = loadDidCache();
         const row = c[key];
@@ -282,6 +282,11 @@
             const h = normalizeHeaders(headersLike);
             const authz = h['authorization'];
             if (!authz || !/^bearer\s+/i.test(authz)) return; // need a bearer token
+            // Only a session access token is worth borrowing. The app also sends short-lived
+            // service-auth tokens under app.bsky.* (e.g. getUploadLimits to video.bsky.app);
+            // those carry no `sub`, and adopting one would repoint every read at that host.
+            // (Decoded only when the token differs from the one we hold - this runs per request.)
+            if (authz !== currentToken() && !jwtSubject(authz)) return;
 
             auth.origin = new URL(url, location.href).origin;
             const replay = { 'authorization': authz };
@@ -380,7 +385,7 @@
             if (auth.origin && auth.headers) {
                 try {
                     const res = await nativeFetch(auth.origin + path, { headers: auth.headers, credentials: 'omit' });
-                    if (res.ok) return res.json();
+                    if (res.ok) return await res.json(); // awaited, so a bad body falls through too
                 } catch (e) { /* fall through to public */ }
             }
             // Fallback: public AppView, no auth (default moderation applies).
@@ -405,9 +410,15 @@
     /* ======================================================================
      * 3. Turn a post into one or more grid tiles.
      * ==================================================================== */
+    // The AppView reports a handle that fails verification as "handle.invalid" - shared by
+    // every such account and unroutable on bsky.app - so treat it as no handle at all.
+    function validHandle(h) {
+        return (h && String(h).toLowerCase() !== 'handle.invalid') ? h : null;
+    }
+
     function postUrl(post) {
         const rkey = post.uri.split('/').pop();
-        const handle = (post.author && post.author.handle) || (post.author && post.author.did);
+        const handle = validHandle(post.author && post.author.handle) || (post.author && post.author.did);
         return 'https://bsky.app/profile/' + handle + '/post/' + rkey;
     }
 
@@ -926,7 +937,10 @@
             });
             appendTiles(tiles);
             logDebug('page: +' + tiles.length + ' tiles, total=' + grid.seen.size + ', done=' + grid.done);
-            if (lbEl && lbEl.style.display !== 'none') prefetchNeighbors(); // warm the freshly-loaded page for the open lightbox
+            if (lbIsOpen()) {
+                updateNavButtons();  // a Next that was hidden at the old end has somewhere to go now
+                prefetchNeighbors(); // warm the freshly-loaded page for the open lightbox
+            }
 
             const noun = grid.videosOnly ? 'videos' : 'media';
             if (grid.done) setSentinel('text', grid.seen.size ? 'End of ' + noun : 'No ' + noun + ' found');
@@ -965,7 +979,7 @@
         if (auth.origin && auth.headers) { // authed first, so moderated media resolves
             try {
                 const res = await nativeFetch(auth.origin + path, { headers: auth.headers, credentials: 'omit' });
-                if (res.ok) return res.json();
+                if (res.ok) return await res.json(); // awaited, so a bad body falls through too
             } catch (e) { /* fall through to public */ }
         }
         const res = await nativeFetch(PUBLIC_API + path, { headers: { 'accept-language': navigator.language || 'en' } });
@@ -1052,18 +1066,24 @@
         while (s.length % 4) s += '=';
         return atob(s);
     }
+    // The account DID from an "Bearer <jwt>" header value, or null if it isn't a
+    // decodable JWT with a did: subject (service-auth tokens have no `sub`).
+    function jwtSubject(authz) {
+        try {
+            const tok = String(authz).replace(/^bearer\s+/i, '');
+            const payload = JSON.parse(b64urlToStr(tok.split('.')[1]));
+            if (payload && typeof payload.sub === 'string' && payload.sub.indexOf('did:') === 0) return payload.sub;
+        } catch (e) { /* not a decodable JWT */ }
+        return null;
+    }
     function getMyDid() {
         const authz = auth.headers && auth.headers.authorization;
         if (!authz) return null;
         const tok = authz.replace(/^bearer\s+/i, '');
         if (myDid && myDidTok === tok) return myDid;
-        try {
-            const payload = JSON.parse(b64urlToStr(tok.split('.')[1]));
-            if (payload && typeof payload.sub === 'string' && payload.sub.indexOf('did:') === 0) {
-                myDid = payload.sub; myDidTok = tok; return myDid;
-            }
-        } catch (e) { /* not a decodable JWT */ }
-        return null;
+        const sub = jwtSubject(authz);
+        if (sub) { myDid = sub; myDidTok = tok; }
+        return sub;
     }
 
     // POST an XRPC procedure on the borrowed session. `useProxy` forwards the
@@ -1328,7 +1348,7 @@
         if (!r || !r.data || grid.actor !== actor) return; // gallery closed or switched while we waited
         const data = r.data;
         profile.did = data.did || null;
-        profile.handle = data.handle || null;
+        profile.handle = validHandle(data.handle); // header/lightbox fall back to the DID
         profile.displayName = data.displayName || '';
         // Authoritative resolve: refresh the cache under both the canonical handle and
         // the spelling the URL used (they can differ in case), so ordinary browsing
@@ -1621,9 +1641,8 @@
         // false lets us stop the page behind the lightbox from scrolling.
         lbEl.addEventListener('wheel', lbWheel, { passive: false });
         lbImg.addEventListener('mousemove', lbImgPan);
-        // The badge is pinned to the media's edges, which move when the stage resizes.
-        // Cheap and gated on the viewer being open, so it costs nothing when it isn't.
-        window.addEventListener('resize', () => { if (lbIsOpen()) positionResBadge(); });
+        // (The window resize hook that re-pins the size badge is registered once in
+        // startDom - this function runs again after every teardown.)
 
         // stopImmediatePropagation + window-capture so we win over Bluesky's own
         // arrow-key shortcuts (which listen on document and would otherwise eat them).
@@ -1752,7 +1771,7 @@
         lbNext.style.visibility = lbIndex < hi ? 'visible' : 'hidden';
     }
 
-    // The thumbnail strip shows the current post's sibling images (2-4); for single
+    // The thumbnail strip shows the current post's sibling images (2-20); for single
     // images and videos it stays hidden. Rebuilt only when the post group changes, so
     // arrowing within a post just moves the highlight (no thumbnail reflow/reload).
     function applyThumbs() {
@@ -1777,10 +1796,21 @@
             }
             thumbsRange = [lo, hi];
         }
-        for (const b of lbThumbs.children)
-            b.classList.toggle('bgt-on', Number(b.getAttribute('data-idx')) === lbIndex);
+        let activeThumb = null;
+        for (const b of lbThumbs.children) {
+            const on = Number(b.getAttribute('data-idx')) === lbIndex;
+            b.classList.toggle('bgt-on', on);
+            if (on) activeThumb = b;
+        }
         lbThumbs.style.display = 'flex';
         lbEl.classList.add('bgt-has-thumbs');
+        // A big gallery post can overflow the strip; keep the highlighted thumb in view.
+        // Scrolled by hand rather than scrollIntoView, which would also nudge the page.
+        if (activeThumb && lbThumbs.scrollWidth > lbThumbs.clientWidth) {
+            const l = activeThumb.offsetLeft, r = l + activeThumb.offsetWidth;
+            if (l < lbThumbs.scrollLeft) lbThumbs.scrollLeft = l - 6;
+            else if (r > lbThumbs.scrollLeft + lbThumbs.clientWidth) lbThumbs.scrollLeft = r - lbThumbs.clientWidth + 6;
+        }
     }
 
     // hls.js arrives via @require; grab it wherever the userscript manager parked it.
@@ -1826,13 +1856,26 @@
             const hls = new HlsLib({ enableWorker: true, abrEwmaDefaultEstimate: startEstimate });
             logDebug('video: hls start estimate', settings.bitrate + ' Mbps');
             lbHls = hls;
+            // Fatal errors get a couple of recovery attempts, then we give up visibly. An
+            // uncapped startLoad() on a persistent failure (deleted video, 404 playlist)
+            // either loops forever or hangs silently on the poster.
+            let recoveries = 0;
+            const HLS_MAX_RECOVERIES = 2;
             hls.on(HlsLib.Events.MANIFEST_PARSED, () => { logDebug('video: manifest parsed'); tryPlay(); });
             hls.on(HlsLib.Events.ERROR, (_evt, data) => {
                 logDebug('video: hls error type=' + (data && data.type) + ' details=' + (data && data.details) + ' fatal=' + (data && data.fatal));
-                if (!data || !data.fatal) return;
-                if (data.type === HlsLib.ErrorTypes.NETWORK_ERROR) hls.startLoad();
-                else if (data.type === HlsLib.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-                else teardownVideo();
+                if (!data || !data.fatal || lbHls !== hls) return; // non-fatal, or a stale instance
+                // A manifest that never loaded has nothing for startLoad() to resume.
+                const manifestFailed = /^manifest/i.test(String(data.details || ''));
+                if (recoveries < HLS_MAX_RECOVERIES && !manifestFailed &&
+                    (data.type === HlsLib.ErrorTypes.NETWORK_ERROR || data.type === HlsLib.ErrorTypes.MEDIA_ERROR)) {
+                    recoveries++;
+                    if (data.type === HlsLib.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+                    else hls.recoverMediaError();
+                    return;
+                }
+                teardownVideo();
+                lbLoadError();
             });
             hls.loadSource(url);
             hls.attachMedia(v);
@@ -2328,6 +2371,7 @@
     // 'push' for a deliberate open, 'none' when back/forward is restoring an entry that
     // already exists (writing anything then would fight the history we just moved to).
     function lbOpenAt(i, mode) {
+        hideTooltip(); // the grid tooltip sits above the lightbox and would linger until the mouse moved
         if (!lbEl) buildLightbox();
         // Set on a fresh open; re-entering a run from history inherits the run's floor.
         if (lbReturnUrl == null) lbReturnUrl = lbHist.baseUrl || location.href;
@@ -2418,6 +2462,10 @@
     function lbWheel(e) {
         // Let the scrollable caption / post-text boxes scroll normally.
         if (e.target.closest && e.target.closest('.bgt-lb-text, .bgt-lb-cap')) return;
+        // A sideways swipe / shift-wheel over an overflowing thumbnail strip scrolls the
+        // strip itself (big gallery posts outgrow it on narrow windows). The strip is
+        // overflow-x only, so letting it through can't scroll the page behind.
+        if (Math.abs(e.deltaX) > Math.abs(e.deltaY) && e.target.closest && e.target.closest('.bgt-lb-thumbs')) return;
         e.preventDefault(); // modal: never scroll the page behind the lightbox
         if (!settings.wheel) return;
 
@@ -2557,7 +2605,7 @@
     function actorAliases(urlActor, author) {
         const s = new Set([String(urlActor).toLowerCase()]);
         if (author) {
-            if (author.handle) s.add(String(author.handle).toLowerCase());
+            if (validHandle(author.handle)) s.add(String(author.handle).toLowerCase());
             if (author.did) s.add(String(author.did).toLowerCase());
         }
         return s;
@@ -2986,7 +3034,16 @@
         io.observe(sentinelEl);
 
         overlayKeyHandler = (e) => {
-            if (e.key === 'Escape' && (!lbEl || lbEl.style.display === 'none')) closeGallery();
+            if (e.key !== 'Escape' || e.defaultPrevented || lbIsOpen()) return;
+            // In-line leaves the rest of the page live, so an Esc there usually belongs to
+            // something else - a search box, a menu, Bluesky's own dialog - and must not
+            // switch the gallery off for good.
+            if (mountedMode === 'inline') {
+                const t = e.target;
+                if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+                if (Array.from(document.querySelectorAll('[aria-modal="true"]')).some(d => !lbEl || !lbEl.contains(d))) return;
+            }
+            closeGallery();
         };
         document.addEventListener('keydown', overlayKeyHandler);
 
@@ -3030,6 +3087,10 @@
     }
 
     function removeOverlay() {
+        // Strand any in-flight loadMore: without a bump it would pass its gen check and
+        // append the old profile's tiles into whatever grid.items is by then (possibly a
+        // cached single-post entry).
+        grid.gen++;
         stopWaiting();
         hideTooltip();
         if (inlineResizeHandler) { window.removeEventListener('resize', inlineResizeHandler); inlineResizeHandler = null; }
@@ -3352,7 +3413,7 @@
         const secLayout = settingsPage('layout', [
             el('div', { class: 'bgt-settings-sub' }, 'How should the media grid appear?'),
             modeRow('fullscreen', 'Full screen', 'Takes over the whole window (default). Most reliable.'),
-            modeRow('inline', 'In-line', 'Embeds the grid in the profile page, keeping the sidebar and header. Depends on Bluesky’s layout, so it may fall back to full screen.'),
+            modeRow('inline', 'In-line', 'Embeds the grid in the profile page, keeping the sidebar and header. Depends on Bluesky’s layout: the grid appears once the profile’s media feed has painted.'),
             el('div', { class: 'bgt-settings-label' }, 'Tile size'),
             el('div', { class: 'bgt-size-group' },
                 sizeChip('small', 'Small'),
@@ -3389,7 +3450,7 @@
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.continuousNav, onChange: (e) => setContinuousNav(e.target.checked) }),
                 el('span', {}, 'Continuous navigation across posts')),
-            el('div', { class: 'bgt-settings-hint' }, 'On: arrows flow through every image. Off: arrows stay within a post’s images — use the thumbnail strip (shown for 2–4 image posts) to jump between them.'),
+            el('div', { class: 'bgt-settings-hint' }, 'On: arrows flow through every image. Off: arrows stay within a post’s images — use the thumbnail strip (shown for multi-image posts) to jump between them.'),
             el('label', { class: 'bgt-check-row' },
                 el('input', { type: 'checkbox', checked: settings.history, onChange: (e) => setHistoryNav(e.target.checked) }),
                 el('span', {}, 'Back/forward buttons navigate the viewer')),
@@ -3925,13 +3986,19 @@
             if (!document.getElementById(BTN_ID)) ensureButton();
         }).observe(document.body, { childList: true, subtree: true });
 
-        // Recolour the nav icon when the user switches light/dark/dim theme.
-        new MutationObserver(updateButtonState)
+        // Recolour the nav icon when the user switches light/dark/dim theme - and re-read
+        // the page surface for the in-line sticky header, which holds it as an inline style.
+        new MutationObserver(() => { updateButtonState(); applyInlineSticky(); })
             .observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
 
         // Honour a typed hash / back-forward landing on one, and let the gallery's own
         // history wrapper coexist with our hash mirroring.
         unsafeWindow.addEventListener('hashchange', onTabHashChange);
+
+        // The lightbox's size badge is pinned to the media's edges, which move when the
+        // stage resizes. Registered once here rather than per buildLightbox (which runs
+        // again after every teardown); gated on the viewer being open, so it's free when not.
+        window.addEventListener('resize', () => { if (lbIsOpen()) positionResBadge(); });
 
         // Bluesky's own viewer has no event to hook, but the full-size image it mounts
         // does: `load` doesn't bubble, yet it DOES capture, so this one listener catches
