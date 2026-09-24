@@ -4,7 +4,7 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.23.0
+// @version      2.24.0
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky
 // @supportURL   https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/issues
@@ -624,6 +624,7 @@
     let rootEl, scrollEl, gridEl, sentinelEl, countEl, io;
     let mountedMode = null, inlineHost = null, inlineResizeHandler = null;
     let headerTitleEl = null, followBtn = null, inlineScrollHandler = null, followVisTick = false;
+    let thumbViewHandler = null;
     // Viewed profile's identity + follow state, populated by loadProfile() from
     // app.bsky.actor.getProfile. followUri is the viewer's follow-record URI (the
     // handle for unfollow) or null; isMe suppresses the button on your own profile.
@@ -850,8 +851,9 @@
         // variant the AppView offers (feed_fullsize doesn't downscale at all, it only
         // re-encodes), so the tile loads the thumb and a drag hands out that same
         // thumb; full resolution belongs to the lightbox.
+        // No src yet: the URL waits in data-src until the thumbnail loader below picks it.
         const img = el('img', {
-            src: thumbUrl(t.thumb), alt: t.alt, loading: 'lazy',
+            'data-src': thumbUrl(t.thumb), alt: t.alt,
             draggable: true, 'data-keep-thumbnail': '1',
         });
         // Real anchor (not a button) so the browser's own link affordances all point
@@ -871,6 +873,141 @@
     // Tile element -> the tile record it was built from. Weak, so a torn-down grid's
     // tiles are collected with it.
     const tileData = new WeakMap();
+
+    /* ---- Grid thumbnail loader ----
+     * Tiles don't use loading="lazy". The browser queues lazy images in the order they
+     * came near the viewport and never reorders or drops them, so a fast scroll (End,
+     * middle-click autoscroll) queues every tile it passes. The ones you stop on then
+     * wait behind hundreds you've already left. Instead each tile holds its URL in
+     * data-src and this loader keeps a few fetches going, always picking:
+     *   1. tiles on screen,
+     *   2. then the next THUMB_AHEAD_ROWS rows below,
+     *   3. then tiles skipped above, nearest first.
+     * Tiles past the look-ahead rows wait until you scroll near them, as lazy did.
+     * The order is re-worked on every scroll.
+     *
+     * A fetch, once started, is always allowed to finish - never cancelled. Instead:
+     *  - Nothing new starts while you're flying past (THUMB_FLYING_SCREENS a second or
+     *    faster): a tile started then would be gone before it arrived.
+     *  - THUMB_WORKERS fetches normally run at once. Each one still running for a tile
+     *    you've scrolled well away from lends one of THUMB_EXTRA_WORKERS more to tiers
+     *    1-2, so the screen you stopped on doesn't wait behind them. As those stale
+     *    fetches land the extras lapse, and it settles back to THUMB_WORKERS. Tier 3
+     *    never gets the extras: its fetches are off screen by definition, and would
+     *    otherwise keep the extras open for themselves.
+     *
+     * "Pending" = the img has a data-src. A tile that has loaded or failed has none,
+     * so a broken thumbnail isn't retried in a loop.
+     */
+    const THUMB_WORKERS = 8;
+    const THUMB_EXTRA_WORKERS = 4;
+    const THUMB_AHEAD_ROWS = 4;
+    const THUMB_SCROLL_MS = 100;       // throttle for scroll-driven passes
+    const THUMB_FLYING_SCREENS = 5;    // scroll speed (screens / second) that counts as flying past
+    const THUMB_SPEED_WINDOW_MS = 80;  // shortest gap the speed is measured over (load-driven passes come closer)
+    // clean: every tile below this index has loaded (or is loading), so the tier-3
+    // scan can stop there instead of walking a few thousand finished tiles each pass.
+    // sample/flying: where the view was at the last speed reading, and the verdict.
+    const thumbs = { inflight: new Set(), timer: null, clean: 0, sample: null, flying: false };
+
+    function resetThumbLoader() {
+        if (thumbs.timer) clearTimeout(thumbs.timer);
+        thumbs.inflight = new Set();
+        thumbs.timer = null;
+        thumbs.clean = 0;
+        thumbs.sample = null;
+        thumbs.flying = false;
+    }
+
+    // A tile's position in the grid, stamped by appendTiles (tiles are only ever
+    // appended, so it never goes stale). -1 for anything not in this grid.
+    function thumbIndex(img) {
+        const t = img.parentNode && tileData.get(img.parentNode);
+        return (t && t._tileIdx != null) ? t._tileIdx : -1;
+    }
+
+    function scheduleThumbs(ms) {
+        if (thumbs.timer) return; // one already queued - it reads the scroll position when it runs
+        thumbs.timer = setTimeout(pumpThumbs, ms || 0);
+    }
+
+    function startThumb(img) {
+        const url = img.getAttribute('data-src');
+        img.removeAttribute('data-src');
+        thumbs.inflight.add(img);
+        img.setAttribute('src', url);
+    }
+
+    // load/error (captured on the grid - neither bubbles) free a slot.
+    function thumbSettled(e) {
+        if (thumbs.inflight.delete(e.target)) scheduleThumbs();
+    }
+
+    // Index of the first tile matching pred. Tiles run in row order, so their rect edges
+    // never decrease along gridEl.children and a binary search holds.
+    function firstTileWhere(tiles, pred) {
+        let lo = 0, hi = tiles.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (pred(tiles[mid].getBoundingClientRect())) hi = mid; else lo = mid + 1;
+        }
+        return lo;
+    }
+
+    function pumpThumbs() {
+        thumbs.timer = null;
+        if (!gridEl || !gridEl.getClientRects().length) return; // unmounted or display:none
+        // The lightbox covers the grid, and its full-size image shares the CDN connection
+        // with every thumbnail - so the grid waits (fetches already out still finish).
+        // lbClosePlain picks it back up.
+        if (lbIsOpen()) return;
+        const tiles = gridEl.children, len = tiles.length;
+        if (!len) return;
+        const pending = (i) => tiles[i].firstElementChild.hasAttribute('data-src');
+
+        const view = scrollEl ? scrollEl.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
+        const cols = getComputedStyle(gridEl).gridTemplateColumns.split(' ').filter(Boolean).length || 1;
+        const first = firstTileWhere(tiles, r => r.bottom > view.top);  // first tile on screen
+        const end = firstTileWhere(tiles, r => r.top >= view.bottom);   // first tile past the bottom edge
+        const aheadEnd = Math.min(len, end + cols * THUMB_AHEAD_ROWS);
+
+        // Scroll speed, in screens a second. Only re-measured once THUMB_SPEED_WINDOW_MS
+        // has passed, since a pass kicked off by a finished load can land a few ms after
+        // a scroll pass, and a gap that short would turn one row of movement into a
+        // wild speed. While flying, start nothing and check again shortly: the timer
+        // keeps running even after the scroll events stop, which is what lets the
+        // screen you land on load at once.
+        const now = Date.now(), s = thumbs.sample;
+        if (!s) thumbs.sample = { first, at: now };
+        else if (now - s.at >= THUMB_SPEED_WINDOW_MS) {
+            const screens = Math.abs(first - s.first) / Math.max(cols, end - first);
+            thumbs.flying = screens * 1000 / (now - s.at) > THUMB_FLYING_SCREENS;
+            thumbs.sample = { first, at: now };
+        }
+        if (thumbs.flying) { scheduleThumbs(THUMB_SCROLL_MS); return; }
+
+        // Tiers 1 + 2: on screen, then the look-ahead rows (contiguous, in that order).
+        // Each fetch still running outside that band (one row above the screen is let
+        // off, so a tile that just scrolled past doesn't count) lends an extra slot.
+        const keepLo = first - cols;
+        let stale = 0;
+        thumbs.inflight.forEach(img => { const i = thumbIndex(img); if (i < keepLo || i >= aheadEnd) stale++; });
+        const cap = THUMB_WORKERS + Math.min(THUMB_EXTRA_WORKERS, stale);
+        for (let i = first; i < aheadEnd && thumbs.inflight.size < cap; i++) {
+            if (pending(i)) startThumb(tiles[i].firstElementChild);
+        }
+
+        // Tier 3: tiles scrolled past without loading, nearest the screen first. The
+        // regular workers only - never the extras.
+        if (thumbs.inflight.size >= THUMB_WORKERS) return;
+        let i = Math.min(first, len) - 1;
+        for (; i >= thumbs.clean; i--) {
+            if (!pending(i)) continue;
+            if (thumbs.inflight.size >= THUMB_WORKERS) break;
+            startThumb(tiles[i].firstElementChild);
+        }
+        if (i < thumbs.clean) thumbs.clean = Math.max(thumbs.clean, Math.min(first, len));
+    }
 
     // One set of listeners on the grid rather than three closures per tile - a profile
     // with a few thousand tiles would otherwise carry several thousand of them.
@@ -907,10 +1044,13 @@
             if (ttTile && ttEl && ttEl.style.display !== 'none') positionTooltip(e.clientX, e.clientY);
         });
         g.addEventListener('mouseleave', hideTooltip);
+        g.addEventListener('load', thumbSettled, true);
+        g.addEventListener('error', thumbSettled, true);
     }
 
     function appendTiles(tiles) {
         const frag = document.createDocumentFragment();
+        let tileIdx = gridEl.children.length; // grid position, for the thumbnail loader
         tiles.forEach(t => {
             const key = t._key || t.thumb || (t.url + t.alt);
             const owner = grid.seen.get(key);
@@ -932,9 +1072,11 @@
                 t._lbIndex = grid.items.length;
                 grid.items.push(viewerItemFrom(t));
             }
+            t._tileIdx = tileIdx++;
             frag.appendChild(makeTile(t));
         });
         gridEl.appendChild(frag);
+        scheduleThumbs();
         if (countEl) countEl.textContent = '· ' + grid.seen.size + (grid.seen.size === 1 ? ' item' : ' items');
     }
 
@@ -966,7 +1108,9 @@
             logDebug('page: +' + tiles.length + ' tiles, total=' + grid.seen.size + ', done=' + grid.done);
             if (lbIsOpen()) {
                 updateNavButtons();  // a Next that was hidden at the old end has somewhere to go now
-                prefetchNeighbors(); // warm the freshly-loaded page for the open lightbox
+                // Warm the freshly-loaded page for the open lightbox - unless the image on
+                // screen is still loading, in which case its onload does this itself.
+                if (!lbLoading || lbLoading.style.display === 'none') prefetchNeighbors();
             }
 
             const noun = grid.videosOnly ? 'videos' : 'media';
@@ -1534,6 +1678,8 @@
 
     function buildLightbox() {
         lbImg = el('img', { class: 'bgt-lbimg', alt: '' });
+        // The picture being looked at outranks the neighbour prefetch (marked low).
+        lbImg.setAttribute('fetchpriority', 'high');
         // Native <video> + controls; hls.js feeds it the .m3u8 (see attachVideo). loop
         // matches Bluesky (lots of "videos" are really gifs, so a single play-through
         // breaks the immersion).
@@ -1708,10 +1854,13 @@
             // it; a cached image is already complete, so we reveal instantly (no flash).
             lbImg.classList.remove('bgt-loaded');
             showLbLoading();
-            lbImg.onload = () => { lbImg.classList.add('bgt-loaded'); hideLbLoading(); updateResBadge(); };
-            lbImg.onerror = () => lbLoadError();
+            // The neighbour prefetch waits for this image to land (or fail): started
+            // alongside it, those five-plus full-size downloads split the bandwidth with
+            // the one picture you're actually waiting on.
+            lbImg.onload = () => { lbImg.classList.add('bgt-loaded'); hideLbLoading(); updateResBadge(); prefetchNeighbors(); };
+            lbImg.onerror = () => { lbLoadError(); prefetchNeighbors(); };
             lbImg.src = fullUrl(it);
-            if (lbImg.complete && lbImg.naturalWidth > 0) { lbImg.classList.add('bgt-loaded'); hideLbLoading(); }
+            if (lbImg.complete && lbImg.naturalWidth > 0) { lbImg.classList.add('bgt-loaded'); hideLbLoading(); prefetchNeighbors(); }
         }
         lbLink.href = it.url;
         lbRecordUrl(); // mirror this image into the address bar + history (debounced)
@@ -1728,7 +1877,9 @@
         // index-driven, so it works even when the grid behind is scrolled out of view
         // (unlike the viewport-gated maybeLoadMore). loadMore() no-ops if busy/done.
         if (settings.continuousNav && grid.items.length - lbIndex <= LB_PREFETCH_AHEAD + 2) loadMore();
-        prefetchNeighbors(); // warm the next few full-size images so fast nav doesn't wait on each
+        // Warm the next few full-size images so fast nav doesn't wait on each. An image
+        // does this from its onload above, once it's on screen; a video has no such wait.
+        if (isVideo) prefetchNeighbors();
     }
 
     // Items from one post share a postState object reference (set once per post in
@@ -2176,6 +2327,7 @@
         }
         const img = new Image();
         img.decoding = 'async';
+        img.setAttribute('fetchpriority', 'low'); // never ahead of the image on screen
         img.src = url;                                // browser fetches into its HTTP cache; lbImg reuses it
         lbPrefetch.set(url, img);
         while (lbPrefetch.size > LB_PREFETCH_CACHE) { // evict oldest beyond the cap
@@ -2557,6 +2709,7 @@
         lbImg.src = '';
         lbPrefetch.forEach(img => { if (!img.complete) img.src = ''; }); // abort in-flight warms
         lbPrefetch.clear(); // release the buffer's Image refs; the HTTP cache still holds the bytes
+        if (gridEl) scheduleThumbs(); // the grid's thumbnail loader waited while we were open
         unsafeWindow.removeEventListener('keydown', lbKeyHandler, true);
         // Hand focus back to whatever had it before the dialog opened (e.g. the tile).
         if (lbPrevFocus && lbPrevFocus.isConnected) { try { lbPrevFocus.focus(); } catch (_) { /* ignore */ } }
@@ -3029,6 +3182,7 @@
         resetProfileState(actor);
 
         gridEl = el('div', { class: 'bgt-grid' });
+        resetThumbLoader();
         bindGridEvents(gridEl);
         sentinelEl = el('div', { class: 'bgt-sentinel' }, el('div', { class: 'bgt-spinner' }));
         pendingHeader = buildHeader(actor); // reads grid.videosOnly, set just above
@@ -3049,6 +3203,11 @@
             if (entries.some(e => e.isIntersecting)) loadMore();
         }, { root: scrollEl || null, rootMargin: '800px' });
         io.observe(sentinelEl);
+        // Re-rank the thumbnail queue as the view moves. Capture phase on window catches
+        // the full-screen .bgt-scroll and Bluesky's inner containers as well as the page.
+        thumbViewHandler = () => scheduleThumbs(THUMB_SCROLL_MS);
+        window.addEventListener('scroll', thumbViewHandler, { passive: true, capture: true });
+        window.addEventListener('resize', thumbViewHandler);
         // Deliberately no Esc-to-close: turning the gallery off is a persisted setting, so
         // it only happens through an explicit control (the nav button or the header ✕),
         // never a stray keypress meant for the lightbox, a search box or a menu.
@@ -3101,6 +3260,12 @@
         hideTooltip();
         if (inlineResizeHandler) { window.removeEventListener('resize', inlineResizeHandler); inlineResizeHandler = null; }
         if (inlineScrollHandler) { window.removeEventListener('scroll', inlineScrollHandler, true); inlineScrollHandler = null; }
+        if (thumbViewHandler) {
+            window.removeEventListener('scroll', thumbViewHandler, true);
+            window.removeEventListener('resize', thumbViewHandler);
+            thumbViewHandler = null;
+        }
+        resetThumbLoader();
         pendingHeader = null;
         lbClosePlain(); // a teardown, not a user close: never rewind the history here
         if (lbEl) { lbEl.remove(); lbEl = null; lbFollowBtn = lbHandleLink = null; }
@@ -3233,19 +3398,31 @@
     }
 
     // Repoints every thumbnail already on screen rather than rebuilding the grid (which
-    // would re-fetch the feed as well). Tiles are loading="lazy", so only the ones you
-    // can actually see fetch again - the rest just carry the new URL until scrolled to.
+    // would re-fetch the feed as well). Grid tiles go back through the thumbnail loader,
+    // so they refetch in scroll order (on screen first) rather than all at once, and each
+    // keeps its old picture until the new one arrives. The lightbox strip is a handful of
+    // images and is just repointed.
     function setThumbFormat(v) {
         if (settings.thumbFormat === v) return;
         settings.thumbFormat = v;
         GM_setValue(THUMBFMT_KEY, v);
-        [gridEl, lbThumbs].forEach(root => {
-            if (!root) return;
-            root.querySelectorAll('img[data-keep-thumbnail]').forEach(img => {
+        if (gridEl) {
+            gridEl.querySelectorAll('.bgt-tile > img').forEach(img => {
+                const cur = img.getAttribute('data-src') || img.getAttribute('src');
+                const next = thumbUrl(cur);
+                if (next === cur) return;
+                thumbs.inflight.delete(img);
+                img.setAttribute('data-src', next);
+            });
+            thumbs.clean = 0;
+            scheduleThumbs();
+        }
+        if (lbThumbs) {
+            lbThumbs.querySelectorAll('img[data-keep-thumbnail]').forEach(img => {
                 const next = thumbUrl(img.getAttribute('src'));
                 if (next !== img.getAttribute('src')) img.setAttribute('src', next);
             });
-        });
+        }
     }
 
     function setDebug(on) {
@@ -3672,6 +3849,8 @@
         #${OVERLAY_ID} .bgt-tile img {
             width: 100%; height: 100%; object-fit: cover; display: block; transition: transform .15s ease;
         }
+        /* Still queued in the thumbnail loader: hide it so the alt text doesn't show. */
+        #${OVERLAY_ID} .bgt-tile img:not([src]) { visibility: hidden; }
         #${OVERLAY_ID} .bgt-tile:hover img { transform: scale(1.04); }
         #${OVERLAY_ID} .bgt-badge {
             position: absolute; left: 6px; bottom: 6px; display: flex; align-items: center; gap: 4px;
