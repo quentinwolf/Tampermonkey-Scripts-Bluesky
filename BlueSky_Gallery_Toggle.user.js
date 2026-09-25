@@ -4,7 +4,7 @@
 // @author       quentinwolf
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
 // @namespace    quentinwolf_bluesky_gallery_toggle
-// @version      2.24.0
+// @version      2.24.1
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky
 // @supportURL   https://github.com/quentinwolf/Tampermonkey-Scripts-Bluesky/issues
@@ -387,12 +387,60 @@
             } catch (e) { /* fall through to public */ }
         }
         const res = await nativeFetch(PUBLIC_API + path, { headers: { 'accept-language': navigator.language || 'en' } });
-        if (!res.ok) throw new Error(method.split('.').pop() + ' ' + res.status);
+        if (!res.ok) {
+            // Keep the AppView's own explanation ("Profile not found") in the message the
+            // sentinel shows, and the status on the error for withDidFallback to test.
+            let body = null;
+            try { body = await res.json(); } catch (_) { /* non-JSON body */ }
+            const msg = body && typeof body.message === 'string' ? body.message : '';
+            const err = new Error(method.split('.').pop() + ' ' + res.status + (msg ? ' (' + msg + ')' : ''));
+            err.status = res.status; err.xrpcError = (body && body.error) || '';
+            throw err;
+        }
         return { data: await res.json(), authed: false };
     }
 
     async function xrpcGet(method, params) {
         return (await xrpcRead(method, params)).data;
+    }
+
+    // A handle can reach an account the AppView won't find by that name: a custom domain
+    // whose DNS still points at the DID after the account moved to another handle (seen
+    // live: brophey.grandpawolf.com -> the account now handled grandpawolf.com). Bluesky's
+    // app resolves handles live, so the profile opens fine, but getProfile / getAuthorFeed
+    // by that handle answer 400 "Profile not found" - they key off the AppView's handle
+    // index. So an actor read that 400s on a handle resolves it live, the way the app
+    // does, and retries once by DID. A handle that needed it is remembered for the
+    // session, so later pages go straight to the DID instead of 400ing first each time.
+    const unindexedHandles = new Map(); // handle(lowercase) -> did
+    const liveResolves = new Map();     // handle(lowercase) -> Promise<did|null>, shared by concurrent callers
+
+    function resolveHandleLive(handle) {
+        const key = String(handle).toLowerCase();
+        if (!liveResolves.has(key)) {
+            liveResolves.set(key, xrpcGet('com.atproto.identity.resolveHandle', { handle: handle })
+                .then(r => (r && typeof r.did === 'string' && r.did.indexOf('did:') === 0) ? r.did : null)
+                .catch(() => null)
+                .then(did => { if (!did) liveResolves.delete(key); return did; })); // a failure may retry later
+        }
+        return liveResolves.get(key);
+    }
+
+    async function withDidFallback(actor, call) {
+        const key = String(actor || '').toLowerCase();
+        const known = unindexedHandles.get(key);
+        if (known) return call(known);
+        try {
+            return await call(actor);
+        } catch (e) {
+            if (!e || e.status !== 400 || !actor || key.indexOf('did:') === 0) throw e;
+            const did = await resolveHandleLive(actor);
+            if (!did) throw e;
+            logDebug('@' + actor + ' not in the AppView handle index; retrying as ' + did);
+            const out = await call(did); // exactly one retry; a failure here is the real error
+            unindexedHandles.set(key, did);
+            return out;
+        }
     }
 
     async function fetchMediaPage(actor, cursor, filter) {
@@ -1088,7 +1136,8 @@
         try {
             const filter = grid.videosOnly ? 'posts_with_video' : 'posts_with_media';
             logDebug('loadMore filter=' + filter + ' cursor=' + (grid.cursor || '(first page)'));
-            const data = await fetchMediaPage(grid.actor, grid.cursor, filter);
+            const cursor = grid.cursor;
+            const data = await withDidFallback(grid.actor, a => fetchMediaPage(a, cursor, filter));
             // The gallery may have switched profile/tab while this page was in flight;
             // its cursor and tiles belong to the old view, so drop them (loadProfile
             // guards the same way).
@@ -1156,7 +1205,7 @@
             const handle = did;
             did = cachedDid(handle);
             if (!did) {
-                did = (await xrpcGet('app.bsky.actor.getProfile', { actor: handle })).did;
+                did = (await withDidFallback(handle, a => xrpcGet('app.bsky.actor.getProfile', { actor: a }))).did;
                 rememberDid(handle, did);
             }
         }
@@ -1469,7 +1518,7 @@
         // Authed so viewer.following comes back; the public fallback carries the handle
         // and display name only (xrpcRead's `authed` flag says which one answered).
         let r;
-        try { r = await xrpcRead('app.bsky.actor.getProfile', { actor: actor }); } catch (e) { r = null; }
+        try { r = await withDidFallback(actor, a => xrpcRead('app.bsky.actor.getProfile', { actor: a })); } catch (e) { r = null; }
         if (!r || !r.data || grid.actor !== actor) return; // gallery closed or switched while we waited
         const data = r.data;
         profile.did = data.did || null;
